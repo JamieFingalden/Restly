@@ -38,18 +38,17 @@ struct ReminderOverlayView: View {
             .padding(.vertical, 44)
             .padding(.horizontal, 32)
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(.white.opacity(0.88))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var background: some View {
         ZStack {
-            Color(red: 0.035, green: 0.055, blue: 0.11)
-                .opacity(0.88)
+            Color(red: 0.006, green: 0.008, blue: 0.014)
 
             RadialGradient(
                 colors: [
-                    Color(red: 0.18, green: 0.42, blue: 0.72).opacity(0.48),
+                    Color(red: 0.08, green: 0.32, blue: 0.34).opacity(0.12),
                     .clear
                 ],
                 center: .topLeading,
@@ -59,7 +58,7 @@ struct ReminderOverlayView: View {
 
             RadialGradient(
                 colors: [
-                    Color(red: 0.33, green: 0.24, blue: 0.62).opacity(0.32),
+                    Color(red: 0.16, green: 0.18, blue: 0.34).opacity(0.08),
                     .clear
                 ],
                 center: .bottomTrailing,
@@ -68,7 +67,7 @@ struct ReminderOverlayView: View {
             )
 
             LinearGradient(
-                colors: [.clear, .black.opacity(0.2)],
+                colors: [.clear, .black.opacity(0.38)],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -99,21 +98,23 @@ struct ReminderOverlayView: View {
             Circle()
                 .stroke(.white.opacity(0.1), lineWidth: 7)
 
-            Circle()
-                .trim(from: 0, to: session.progress)
-                .stroke(
-                    AngularGradient(
-                        colors: [
-                            Color(red: 0.42, green: 0.78, blue: 1),
-                            Color(red: 0.65, green: 0.55, blue: 1),
-                            Color(red: 0.42, green: 0.78, blue: 1)
-                        ],
-                        center: .center
-                    ),
-                    style: StrokeStyle(lineWidth: 7, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: 0.35), value: session.progress)
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                Circle()
+                    .trim(from: 0, to: session.progress(at: timeline.date))
+                    .stroke(
+                        AngularGradient(
+                            colors: [
+                                Color(red: 0.42, green: 0.78, blue: 1),
+                                Color(red: 0.65, green: 0.55, blue: 1),
+                                Color(red: 0.42, green: 0.78, blue: 1)
+                            ],
+                            center: .center
+                        ),
+                        style: StrokeStyle(lineWidth: 7, lineCap: .round)
+                    )
+                    .opacity(0.68)
+                    .rotationEffect(.degrees(-90))
+            }
 
             VStack(spacing: 2) {
                 Text("\(session.remainingSeconds)")
@@ -128,7 +129,6 @@ struct ReminderOverlayView: View {
             .accessibilityLabel("剩余 \(session.remainingSeconds) 秒")
         }
         .frame(width: 220, height: 220)
-        .shadow(color: Color.blue.opacity(0.18), radius: 36)
     }
 
     private var actions: some View {
@@ -155,14 +155,16 @@ private struct RestlyOverlayButtonStyle: ButtonStyle {
             .font(.system(size: 14, weight: .semibold, design: .rounded))
             .padding(.horizontal, 22)
             .padding(.vertical, 12)
-            .foregroundStyle(isProminent ? Color(red: 0.06, green: 0.08, blue: 0.14) : .white.opacity(0.82))
+            .foregroundStyle(.white.opacity(isProminent ? 0.9 : 0.74))
             .background(
-                isProminent ? .white.opacity(configuration.isPressed ? 0.72 : 0.92) : .white.opacity(configuration.isPressed ? 0.14 : 0.08),
+                isProminent
+                    ? Color(red: 0.08, green: 0.26, blue: 0.28).opacity(configuration.isPressed ? 0.72 : 0.9)
+                    : .white.opacity(configuration.isPressed ? 0.12 : 0.06),
                 in: Capsule()
             )
             .overlay {
                 Capsule()
-                    .stroke(.white.opacity(isProminent ? 0 : 0.12), lineWidth: 1)
+                    .stroke(.white.opacity(isProminent ? 0.15 : 0.1), lineWidth: 1)
             }
             .scaleEffect(configuration.isPressed ? 0.97 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)

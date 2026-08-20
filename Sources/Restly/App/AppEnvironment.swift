@@ -14,12 +14,14 @@ final class AppEnvironment: ObservableObject {
         let activityMonitor = ActivityMonitor()
         let toastManager = ToastManager()
         let overlayController = EyeRestOverlayController()
+        let screenLockManager = ScreenLockManager()
 
         let reminderManager = ReminderManager(
             settings: settings,
             activityMonitor: activityMonitor,
             toastManager: toastManager,
-            overlayController: overlayController
+            overlayController: overlayController,
+            screenLockManager: screenLockManager
         )
         let launchAtLoginManager = LaunchAtLoginManager()
         let settingsWindowController = SettingsWindowController(
@@ -47,13 +49,21 @@ final class AppEnvironment: ObservableObject {
         if arguments.contains("--show-water-preview") {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(1))
-                toastManager.show(.water, intervalMinutes: settings.waterIntervalMinutes)
+                toastManager.show(
+                    .water,
+                    intervalMinutes: settings.waterIntervalMinutes,
+                    autoDismiss: settings.autoDismissHealthToasts
+                )
             }
         }
         if arguments.contains("--show-stand-preview") {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(1))
-                toastManager.show(.stand, intervalMinutes: settings.standIntervalMinutes)
+                toastManager.show(
+                    .stand,
+                    intervalMinutes: settings.standIntervalMinutes,
+                    autoDismiss: settings.autoDismissHealthToasts
+                )
             }
         }
     }

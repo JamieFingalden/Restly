@@ -34,6 +34,14 @@ final class ReminderSettings: ObservableObject {
         didSet { persist(idleThresholdMinutes, forKey: Keys.idleThresholdMinutes) }
     }
 
+    @Published var autoDismissHealthToasts: Bool {
+        didSet { persist(autoDismissHealthToasts, forKey: Keys.autoDismissHealthToasts) }
+    }
+
+    @Published var lockScreenAfterStanding: Bool {
+        didSet { persist(lockScreenAfterStanding, forKey: Keys.lockScreenAfterStanding) }
+    }
+
     var onChange: (() -> Void)?
 
     private let defaults: UserDefaults
@@ -49,6 +57,8 @@ final class ReminderSettings: ObservableObject {
         standEnabled = defaults.object(forKey: Keys.standEnabled) as? Bool ?? true
         standIntervalMinutes = defaults.object(forKey: Keys.standIntervalMinutes) as? Int ?? 50
         idleThresholdMinutes = defaults.object(forKey: Keys.idleThresholdMinutes) as? Int ?? 3
+        autoDismissHealthToasts = defaults.object(forKey: Keys.autoDismissHealthToasts) as? Bool ?? false
+        lockScreenAfterStanding = defaults.object(forKey: Keys.lockScreenAfterStanding) as? Bool ?? false
         isLoading = false
     }
 
@@ -79,5 +89,7 @@ final class ReminderSettings: ObservableObject {
         static let standEnabled = "standEnabled"
         static let standIntervalMinutes = "standIntervalMinutes"
         static let idleThresholdMinutes = "idleThresholdMinutes"
+        static let autoDismissHealthToasts = "autoDismissHealthToasts"
+        static let lockScreenAfterStanding = "lockScreenAfterStanding"
     }
 }

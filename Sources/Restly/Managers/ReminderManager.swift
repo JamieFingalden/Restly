@@ -15,16 +15,19 @@ final class ReminderManager: NSObject, ObservableObject {
     private let activityMonitor: ActivityMonitor
     private let toastManager: ToastManager
     private let overlayController: EyeRestOverlayController
+    private let screenLockManager: ScreenLockManager
     private let defaults: UserDefaults
     private let schedulerInterval: TimeInterval = 5
     private var scheduler: Timer?
     private var lastTick = Date()
+    private var isSessionActive = true
 
     init(
         settings: ReminderSettings,
         activityMonitor: ActivityMonitor,
         toastManager: ToastManager,
         overlayController: EyeRestOverlayController,
+        screenLockManager: ScreenLockManager,
         runtimeConfiguration: RuntimeConfiguration = .current,
         defaults: UserDefaults = .standard
     ) {
@@ -32,6 +35,7 @@ final class ReminderManager: NSObject, ObservableObject {
         self.activityMonitor = activityMonitor
         self.toastManager = toastManager
         self.overlayController = overlayController
+        self.screenLockManager = screenLockManager
         self.runtimeConfiguration = runtimeConfiguration
         self.defaults = defaults
         countdowns = Dictionary(
@@ -88,6 +92,9 @@ final class ReminderManager: NSObject, ObservableObject {
         let date = Date().addingTimeInterval(TimeInterval(minutes * 60))
         pauseUntil = date
         defaults.set(date, forKey: Keys.pauseUntil)
+        toastManager.cancelEyeRestHeadsUp()
+        toastManager.cancelScreenLockCountdown()
+        toastManager.suspendQueue()
         overlayController.dismiss()
         lastTick = Date()
     }
@@ -95,6 +102,7 @@ final class ReminderManager: NSObject, ObservableObject {
     func resume() {
         pauseUntil = nil
         defaults.removeObject(forKey: Keys.pauseUntil)
+        resumeToastQueueIfAllowed()
         lastTick = Date()
     }
 
@@ -175,6 +183,7 @@ final class ReminderManager: NSObject, ObservableObject {
         if let pauseUntil, pauseUntil <= now {
             self.pauseUntil = nil
             defaults.removeObject(forKey: Keys.pauseUntil)
+            resumeToastQueueIfAllowed()
         }
         guard !isPaused(at: now), sample.state == .active else { return }
 
@@ -202,14 +211,37 @@ final class ReminderManager: NSObject, ObservableObject {
 
         switch type {
         case .eyeRest:
-            overlayController.show(durationSeconds: settings.eyeRestDurationSeconds) { [weak self] action in
-                self?.handleAction(action, for: .eyeRest)
-            }
+            toastManager.showEyeRestHeadsUp(
+                onStart: { [weak self] in
+                    self?.beginEyeRestOverlay()
+                },
+                onSnooze: { [weak self] in
+                    self?.snooze(.eyeRest, minutes: 5)
+                }
+            )
         case .water, .stand:
             let intervalMinutes = type == .water
                 ? settings.waterIntervalMinutes
                 : settings.standIntervalMinutes
-            toastManager.show(type, intervalMinutes: intervalMinutes)
+            toastManager.show(
+                type,
+                intervalMinutes: intervalMinutes,
+                autoDismiss: settings.autoDismissHealthToasts
+            )
+        }
+    }
+
+    private func beginEyeRestOverlay() {
+        guard settings.eyeEnabled, !isPaused() else {
+            resumeToastQueueIfAllowed()
+            return
+        }
+
+        toastManager.suspendQueue()
+        overlayController.show(durationSeconds: settings.eyeRestDurationSeconds) { [weak self] action in
+            guard let self else { return }
+            self.resumeToastQueueIfAllowed()
+            self.handleAction(action, for: .eyeRest)
         }
     }
 
@@ -217,10 +249,16 @@ final class ReminderManager: NSObject, ObservableObject {
         switch action {
         case .completed:
             complete(type)
+            if type == .stand, settings.lockScreenAfterStanding {
+                toastManager.showScreenLockCountdown { [weak self] in
+                    guard let self, self.settings.lockScreenAfterStanding else { return }
+                    self.screenLockManager.lockScreen()
+                }
+            }
         case .skipped:
             skip(type)
         case .snoozed:
-            snooze(type)
+            snooze(type, minutes: type == .eyeRest ? 10 : 5)
         }
     }
 
@@ -242,8 +280,17 @@ final class ReminderManager: NSObject, ObservableObject {
     }
 
     private func handleSettingsChanged() {
+        toastManager.cancelEyeRestHeadsUp()
+        if !settings.lockScreenAfterStanding {
+            toastManager.cancelScreenLockCountdown()
+        }
         resetAll()
         lastTick = Date()
+    }
+
+    private func resumeToastQueueIfAllowed() {
+        guard isSessionActive, !isPaused(), !overlayController.isVisible else { return }
+        toastManager.resumeQueue()
     }
 
     private func observeWorkspaceEvents() {
@@ -262,13 +309,13 @@ final class ReminderManager: NSObject, ObservableObject {
         )
         center.addObserver(
             self,
-            selector: #selector(systemWillSuspend),
+            selector: #selector(sessionDidResignActive),
             name: NSWorkspace.sessionDidResignActiveNotification,
             object: nil
         )
         center.addObserver(
             self,
-            selector: #selector(systemDidResume),
+            selector: #selector(sessionDidBecomeActive),
             name: NSWorkspace.sessionDidBecomeActiveNotification,
             object: nil
         )
@@ -277,7 +324,10 @@ final class ReminderManager: NSObject, ObservableObject {
     @objc private func systemWillSuspend() {
         activityMonitor.markSleeping()
         activityState = .sleeping
+        toastManager.cancelEyeRestHeadsUp()
+        toastManager.cancelScreenLockCountdown()
         overlayController.dismiss()
+        toastManager.suspendQueue()
         lastTick = Date()
     }
 
@@ -285,6 +335,23 @@ final class ReminderManager: NSObject, ObservableObject {
         activityMonitor.markAwake()
         resetAll()
         lastTick = Date()
+        resumeToastQueueIfAllowed()
+        sampleAndAdvance()
+    }
+
+    @objc private func sessionDidResignActive() {
+        isSessionActive = false
+        activityMonitor.markSleeping()
+        activityState = .sleeping
+        toastManager.suspendQueue()
+        lastTick = Date()
+    }
+
+    @objc private func sessionDidBecomeActive() {
+        isSessionActive = true
+        activityMonitor.markAwake()
+        lastTick = Date()
+        resumeToastQueueIfAllowed()
         sampleAndAdvance()
     }
 

@@ -7,11 +7,12 @@ final class EyeRestSession: ObservableObject {
     let totalSeconds: Int
 
     var progress: Double {
-        Double(remainingSeconds) / Double(totalSeconds)
+        progress(at: Date())
     }
 
     private let onFinish: (ReminderAction) -> Void
     private var timer: Timer?
+    private var endDate: Date?
 
     init(durationSeconds: Int, onFinish: @escaping (ReminderAction) -> Void) {
         let duration = max(1, durationSeconds)
@@ -20,14 +21,23 @@ final class EyeRestSession: ObservableObject {
         self.onFinish = onFinish
     }
 
-    func start() {
+    func start(at startDate: Date = Date()) {
+        cancel()
+        endDate = startDate.addingTimeInterval(TimeInterval(totalSeconds))
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.tick()
+                self?.tick(at: Date())
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+    }
+
+    func progress(at date: Date) -> Double {
+        guard let endDate else {
+            return Double(remainingSeconds) / Double(totalSeconds)
+        }
+        return min(max(endDate.timeIntervalSince(date) / Double(totalSeconds), 0), 1)
     }
 
     func skip() {
@@ -43,8 +53,9 @@ final class EyeRestSession: ObservableObject {
         timer = nil
     }
 
-    private func tick() {
-        remainingSeconds -= 1
+    private func tick(at date: Date) {
+        guard let endDate else { return }
+        remainingSeconds = max(0, Int(ceil(endDate.timeIntervalSince(date))))
         if remainingSeconds <= 0 {
             finish(with: .completed)
         }
@@ -109,30 +120,18 @@ final class EyeRestOverlayController {
             screen: screen
         )
         panel.setFrame(screen.frame, display: true)
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
+        panel.backgroundColor = NSColor(calibratedWhite: 0.008, alpha: 1)
+        panel.isOpaque = true
         panel.hasShadow = false
         panel.level = .screenSaver
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hidesOnDeactivate = false
         panel.isMovable = false
 
-        let visualEffectView = NSVisualEffectView(frame: panel.contentView?.bounds ?? .zero)
-        visualEffectView.material = .fullScreenUI
-        visualEffectView.blendingMode = .behindWindow
-        visualEffectView.state = .active
-        visualEffectView.autoresizingMask = [.width, .height]
-
         let hostingView = NSHostingView(rootView: ReminderOverlayView(session: session))
-        hostingView.translatesAutoresizingMaskIntoConstraints = false
-        visualEffectView.addSubview(hostingView)
-        NSLayoutConstraint.activate([
-            hostingView.leadingAnchor.constraint(equalTo: visualEffectView.leadingAnchor),
-            hostingView.trailingAnchor.constraint(equalTo: visualEffectView.trailingAnchor),
-            hostingView.topAnchor.constraint(equalTo: visualEffectView.topAnchor),
-            hostingView.bottomAnchor.constraint(equalTo: visualEffectView.bottomAnchor)
-        ])
-        panel.contentView = visualEffectView
+        hostingView.frame = NSRect(origin: .zero, size: screen.frame.size)
+        hostingView.autoresizingMask = [.width, .height]
+        panel.contentView = hostingView
         return panel
     }
 }

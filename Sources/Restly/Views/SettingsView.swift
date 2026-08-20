@@ -130,14 +130,48 @@ struct SettingsView: View {
                 ) {
                     Toggle("开启站立提醒", isOn: $settings.standEnabled)
                     SettingsDivider()
-                    NumberSettingRow(
-                        title: "连续使用",
-                        value: $settings.standIntervalMinutes,
-                        range: 1...180,
-                        step: 1,
-                        unit: "分钟"
-                    )
+                    Group {
+                        NumberSettingRow(
+                            title: "连续使用",
+                            value: $settings.standIntervalMinutes,
+                            range: 1...180,
+                            step: 1,
+                            unit: "分钟"
+                        )
+                        SettingsDivider()
+                        Toggle(
+                            "点击「我起来了」后锁定电脑",
+                            isOn: $settings.lockScreenAfterStanding
+                        )
+                        Label(
+                            "锁定前会显示 2 秒倒计时，可以取消。",
+                            systemImage: "lock.fill"
+                        )
+                        .font(.system(size: 12, design: .rounded))
+                        .foregroundStyle(.secondary)
+                    }
                     .disabled(!settings.standEnabled)
+                }
+
+                SettingsCard(
+                    title: "浮窗提醒",
+                    subtitle: "喝水与站立提醒共用",
+                    systemImage: "rectangle.topthird.inset.filled",
+                    tint: .teal
+                ) {
+                    Toggle(
+                        "5 秒后自动消失",
+                        isOn: $settings.autoDismissHealthToasts
+                    )
+                    SettingsDivider()
+                    Label(
+                        settings.autoDismissHealthToasts
+                            ? "未操作时，浮窗会在 5 秒后收起。"
+                            : "浮窗会一直保留，直到你点击完成或稍后提醒。",
+                        systemImage: "info.circle"
+                    )
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundStyle(.secondary)
                 }
             }
             .padding(24)
