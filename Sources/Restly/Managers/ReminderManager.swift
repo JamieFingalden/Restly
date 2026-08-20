@@ -13,7 +13,7 @@ final class ReminderManager: NSObject, ObservableObject {
 
     private let settings: ReminderSettings
     private let activityMonitor: ActivityMonitor
-    private let notificationManager: NotificationManager
+    private let toastManager: ToastManager
     private let overlayController: EyeRestOverlayController
     private let defaults: UserDefaults
     private let schedulerInterval: TimeInterval = 5
@@ -23,14 +23,14 @@ final class ReminderManager: NSObject, ObservableObject {
     init(
         settings: ReminderSettings,
         activityMonitor: ActivityMonitor,
-        notificationManager: NotificationManager,
+        toastManager: ToastManager,
         overlayController: EyeRestOverlayController,
         runtimeConfiguration: RuntimeConfiguration = .current,
         defaults: UserDefaults = .standard
     ) {
         self.settings = settings
         self.activityMonitor = activityMonitor
-        self.notificationManager = notificationManager
+        self.toastManager = toastManager
         self.overlayController = overlayController
         self.runtimeConfiguration = runtimeConfiguration
         self.defaults = defaults
@@ -50,7 +50,7 @@ final class ReminderManager: NSObject, ObservableObject {
         settings.onChange = { [weak self] in
             self?.handleSettingsChanged()
         }
-        notificationManager.actionHandler = { [weak self] type, action in
+        toastManager.actionHandler = { [weak self] type, action in
             self?.handleAction(action, for: type)
         }
         observeWorkspaceEvents()
@@ -206,10 +206,10 @@ final class ReminderManager: NSObject, ObservableObject {
                 self?.handleAction(action, for: .eyeRest)
             }
         case .water, .stand:
-            notificationManager.send(
-                type,
-                standIntervalMinutes: type == .stand ? settings.standIntervalMinutes : nil
-            )
+            let intervalMinutes = type == .water
+                ? settings.waterIntervalMinutes
+                : settings.standIntervalMinutes
+            toastManager.show(type, intervalMinutes: intervalMinutes)
         }
     }
 

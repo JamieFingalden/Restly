@@ -79,7 +79,7 @@ struct SettingsView: View {
             VStack(spacing: 14) {
                 SettingsCard(
                     title: "喝水",
-                    subtitle: "用轻量系统通知提醒补充水分",
+                    subtitle: "用轻量浮窗提醒补充水分",
                     systemImage: "drop.fill",
                     tint: .blue
                 ) {

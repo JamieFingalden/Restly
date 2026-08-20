@@ -12,13 +12,13 @@ final class AppEnvironment: ObservableObject {
         let arguments = ProcessInfo.processInfo.arguments
         let settings = ReminderSettings()
         let activityMonitor = ActivityMonitor()
-        let notificationManager = NotificationManager()
+        let toastManager = ToastManager()
         let overlayController = EyeRestOverlayController()
 
         let reminderManager = ReminderManager(
             settings: settings,
             activityMonitor: activityMonitor,
-            notificationManager: notificationManager,
+            toastManager: toastManager,
             overlayController: overlayController
         )
         let launchAtLoginManager = LaunchAtLoginManager()
@@ -47,13 +47,13 @@ final class AppEnvironment: ObservableObject {
         if arguments.contains("--show-water-preview") {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(1))
-                notificationManager.send(.water)
+                toastManager.show(.water, intervalMinutes: settings.waterIntervalMinutes)
             }
         }
         if arguments.contains("--show-stand-preview") {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(1))
-                notificationManager.send(.stand, standIntervalMinutes: 1)
+                toastManager.show(.stand, intervalMinutes: settings.standIntervalMinutes)
             }
         }
     }
