@@ -613,10 +613,80 @@ final class FocusModeLinkageTests: XCTestCase {
         )
     }
 
+    // MARK: - 关键词子串匹配与选名结算（codex 五轮 ②③）
+
+    /// 「Deep Focus」这类含关键词但不全等的自建模式必须命中：
+    /// 全等匹配会把它跳过、错落到不相干的自定义模式上。
+    func testFocusTargetParsingMatchesKeywordSubstrings() throws {
+        let fixture = """
+        {"data": [{"modeConfigurations": {
+            "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}},
+            "com.apple.sleep.sleep-mode": {"mode": {"name": "Sleep", "modeIdentifier": "com.apple.sleep.sleep-mode"}},
+            "com.apple.donotdisturb.mode.custom": {"mode": {"name": "Deep Focus", "modeIdentifier": "com.apple.donotdisturb.mode.custom"}}
+        }}]}
+        """
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-\(UUID().uuidString).json")
+        try fixture.data(using: .utf8)!.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let target = try XCTUnwrap(FocusModeBridge.readFocusTarget(at: url))
+        XCTAssertEqual(target.identifier, "com.apple.donotdisturb.mode.custom")
+        XCTAssertEqual(target.displayName, "Deep Focus")
+    }
+
+    /// 下拉选名后的结算契约：名字变化使旧缓存作废，强制重检给出
+    /// .ready 时熔断复位并触发一次 onMissingCleared（manager 靠它
+    /// 补执行当前段）。
+    @MainActor
+    func testSelectingExistingShortcutsByNameSettlesCircuitBreaker() async {
+        let stub = RunnerStub(responses: [
+            (1, "找不到快捷指令"),          // run 失败
+            (0, ""),                       // list：A/B 缺失 → 熔断
+            (0, "C\nD\n"),                // 选名后强制重检：ready
+        ])
+        var names = FocusModeBridge.ShortcutNames(on: "A", off: "B")
+        var clearedCount = 0
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { names },
+            focusTargetProvider: { nil }
+        )
+        bridge.onMissingCleared = { clearedCount += 1 }
+
+        // 熔断要经执行侧 run 失败 + list 确认才置位（与生产一致）。
+        _ = await bridge.setFocusEngaged(true)
+        XCTAssertTrue(bridge.isMissing)
+
+        // 「下拉选中」= 指认换成真实存在的名字 + 强制重检。
+        names = .init(on: "C", off: "D")
+        let existence = await bridge.checkShortcutsExist(forceRefresh: true)
+
+        XCTAssertEqual(existence, .ready)
+        XCTAssertFalse(bridge.isMissing)
+        XCTAssertEqual(clearedCount, 1, "熔断复位恰好触发一次重跑钩子")
+    }
+
     // MARK: - 呈现延迟与开关竞态（codex 四轮 ①②）
 
     /// 对话框退场动画期间 present 会被静默丢弃：统一推迟呈现的
     /// 工具函数契约 —— 延迟到点前不执行、到点后执行。
+    /// 取消（如 400ms 内生成失败、重启流程）后闭包不得执行 ——
+    /// 否则失败终态会被改回 .waiting、旧 sheet 会被拉回来。
+    @MainActor
+    func testDeferredPresentationHonoursCancellation() async {
+        final class FlagBox: @unchecked Sendable {
+            var flag = false
+        }
+        let box = FlagBox()
+        let task = SettingsView.presentAfterDialogDismissal(delay: .milliseconds(200)) {
+            box.flag = true
+        }
+        task.cancel()
+        await task.value
+        XCTAssertFalse(box.flag, "取消后闭包不得执行")
+    }
+
     @MainActor
     func testDeferredPresentationRunsClosureAfterDelay() async {
         final class FlagBox: @unchecked Sendable {

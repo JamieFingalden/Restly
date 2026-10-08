@@ -626,8 +626,15 @@ final class FocusModeBridge: ObservableObject {
             return fallback
         }
 
-        let preferredNames = ["专注", "Focus", "Work", "工作"]
-        if let preferred = modes.first(where: { preferredNames.contains($0.displayName) }) {
+        // 关键词按「大小写不敏感的子串」匹配：用户起的「Deep Focus」
+        // 「Work Hours」这类名字含关键词但不全等，全等匹配会把它跳过、
+        // 错落到不相干的自定义模式上。
+        let preferredKeywords = ["专注", "Focus", "Work", "工作"]
+        if let preferred = modes.first(where: { mode in
+            preferredKeywords.contains { keyword in
+                mode.displayName.range(of: keyword, options: [.caseInsensitive]) != nil
+            }
+        }) {
             return preferred
         }
         if let stable = modes.first(where: { !coreModeIdentifiers.contains($0.identifier) }) {

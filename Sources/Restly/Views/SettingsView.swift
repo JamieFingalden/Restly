@@ -245,6 +245,14 @@ struct SettingsView: View {
         }
     }
 
+    /// 名字指认变化（下拉选择或手输提交）后的统一结算：强制重检
+    /// 就绪状态 —— 检测给出 .ready 时 bridge 复位熔断并触发
+    /// onMissingCleared，manager 随即补执行当前段的联动，不用等用户
+    /// 另行刷新或重启。
+    private func settleAfterShortcutNameChange() {
+        Task { await refreshLinkageStatus(force: true) }
+    }
+
     private func shortcutNameRow(
         title: String,
         placeholder: String,
@@ -258,7 +266,10 @@ struct SettingsView: View {
             Menu {
                 if let availableShortcutNames {
                     ForEach(availableShortcutNames, id: \.self) { name in
-                        Button(name) { binding.wrappedValue = name }
+                        Button(name) {
+                        binding.wrappedValue = name
+                        settleAfterShortcutNameChange()
+                    }
                     }
                 } else {
                     Button("先加载列表") { loadAvailableShortcutNames(force: false) }
@@ -266,6 +277,7 @@ struct SettingsView: View {
                 Divider()
                 Button("刷新列表") { loadAvailableShortcutNames(force: true) }
             } label: {
+                // 下拉选中走与手输提交完全相同的结算路径。
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 10, weight: .semibold))
             }
@@ -273,7 +285,7 @@ struct SettingsView: View {
             .fixedSize()
         }
         .font(.system(size: 12.5, design: .rounded))
-        .onSubmit { Task { await refreshLinkageStatus() } }
+        .onSubmit { settleAfterShortcutNameChange() }
     }
 
     private func loadAvailableShortcutNames(force: Bool) {
@@ -328,6 +340,10 @@ struct SettingsView: View {
     ) -> Task<Void, Never> {
         Task { @MainActor in
             try? await Task.sleep(for: delay)
+            // sleep 吞掉 CancellationError 也要拦住已取消的呈现：
+            // 否则 400ms 内生成的失败终态会被改回 .waiting，重启流程
+            // 时取消的未决呈现也会把旧 sheet 拉回来。
+            guard !Task.isCancelled else { return }
             present()
         }
     }
