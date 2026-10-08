@@ -348,6 +348,9 @@ struct SettingsView: View {
             switch outcome {
             case .opened:
                 break
+            case .cancelled:
+                // cancelInstallFlow 已把 sheet 收掉、状态归位，这里不再动。
+                return
             case .generationFailed(let reason):
                 installSheet = .generationFailed(reason)
                 return

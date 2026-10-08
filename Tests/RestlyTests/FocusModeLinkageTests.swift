@@ -22,9 +22,14 @@ final class FocusModeLinkageTests: XCTestCase {
         private(set) var invocations: [Invocation] = []
         /// 按次出队的应答；耗尽后走默认成功应答。
         private var responses: [(status: Int32, output: String)] = []
+        /// 挂住 run 命令不回结果（模拟 enable 在飞）。
+        private let holdRuns: Bool
+        /// 每次 sign 调用前回调（序号从 0 起），供测试在精确时机取消。
+        var signGate: ((Int) -> Void)?
 
-        init(responses: [(Int32, String)] = []) {
+        init(responses: [(Int32, String)] = [], holdRuns: Bool = false) {
             self.responses = responses
+            self.holdRuns = holdRuns
         }
 
         var runner: FocusModeBridge.ProcessRunner {
@@ -36,6 +41,14 @@ final class FocusModeLinkageTests: XCTestCase {
                     name: rest.count > 1 ? rest[1] : "",
                     argv: rest
                 ))
+                if holdRuns, rest.first == "run" {
+                    // 不调 completion：调用方永远停在 await 上。
+                    return
+                }
+                if rest.first == "sign" {
+                    let signCount = invocations.filter { $0.command == "sign" }.count
+                    signGate?(signCount - 1)
+                }
                 let response = responses.isEmpty ? (Int32(0), "") : responses.removeFirst()
                 // 模拟真 sign 的契约：成功时要在 -o 位置产出文件，
                 // 否则 bridge 的「签名后写回原路径」无从谈起。
@@ -483,6 +496,106 @@ final class FocusModeLinkageTests: XCTestCase {
         manager.stop()
         await drain()
         XCTAssertEqual(runCalls(in: stub).last?.name, "关闭专注模式")
+    }
+
+    // MARK: - 管道并发消费（codex 三轮 ①）
+
+    /// 子进程输出超过 64KB 管道缓冲时，先 waitUntilExit 的旧实现会
+    /// 死锁（子进程写阻塞 vs 父进程等退出）——这条用 200KB 输出钉住
+    /// 「先并发读、后等退出」的契约。defaultRunner internal 即为此。
+    func testDefaultRunnerDrainsLargeChildOutput() async {
+        let workQueue = DispatchQueue(label: "FocusModeLinkageTests.runner")
+        let runner = FocusModeBridge.defaultRunner(workQueue: workQueue)
+        final class OutputBox: @unchecked Sendable {
+            var status: Int32?
+            var output = ""
+        }
+        let box = OutputBox()
+        let expectation = XCTestExpectation(description: "默认执行器返回大输出")
+        runner(["/bin/sh", "-c", "head -c 200000 /dev/zero | base64"]) { status, output in
+            box.status = status
+            box.output = output
+            expectation.fulfill()
+        }
+        await fulfillment(of: [expectation], timeout: 30)
+        XCTAssertEqual(box.status, 0)
+        XCTAssertGreaterThan(box.output.utf8.count, 128 * 1024, "超过管道缓冲的输出必须完整收回")
+    }
+
+    func testDefaultRunnerPropagatesFailureStatusAndOutput() async {
+        let workQueue = DispatchQueue(label: "FocusModeLinkageTests.runner")
+        let runner = FocusModeBridge.defaultRunner(workQueue: workQueue)
+        final class OutputBox: @unchecked Sendable {
+            var status: Int32?
+            var output = ""
+        }
+        let box = OutputBox()
+        let expectation = XCTestExpectation(description: "默认执行器带回失败输出")
+        runner(["/bin/sh", "-c", "echo boom; exit 3"]) { status, output in
+            box.status = status
+            box.output = output
+            expectation.fulfill()
+        }
+        await fulfillment(of: [expectation], timeout: 30)
+        XCTAssertEqual(box.status, 3)
+        XCTAssertTrue(box.output.contains("boom"), "失败输出要用于诊断")
+    }
+
+    // MARK: - 取消不留外部副作用（codex 三轮 ②）
+
+    /// 首签一完成就取消：第二次签名、两次打开都必须被拦下。
+    @MainActor
+    func testInstallCancellationAfterFirstSignSkipsAllOpens() async {
+        let stub = RunnerStub()
+        final class TaskBox: @unchecked Sendable {
+            var task: Task<FocusModeBridge.InstallOutcome, Never>?
+        }
+        let taskBox = TaskBox()
+        stub.signGate = { index in
+            if index == 0 { taskBox.task?.cancel() }
+        }
+        var opened: [String] = []
+        let bridge = makeBridge(
+            runner: stub.runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式"),
+            openHandler: { opened.append($0.lastPathComponent); return true }
+        )
+
+        let installTask = Task { await bridge.installShortcuts() }
+        taskBox.task = installTask
+        let outcome = await installTask.value
+
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertTrue(opened.isEmpty, "取消后不得再有外部副作用（零 open）")
+        // 剩余未交出的文件要清场。
+        if let firstSource = stub.invocations.first(where: { $0.command == "sign" })?.argv[2] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: firstSource),
+                "未打开的临时文件不留残骸"
+            )
+        }
+    }
+
+    // MARK: - 退出覆盖在飞开启（codex 三轮 ③）
+
+    @MainActor
+    func testTerminateCoversInFlightEnable() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let recorder = SyncLaunchRecorder()
+        let bridge = makeBridge(runner: RunnerStub(holdRuns: true).runner, syncLaunchRecorder: recorder)
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        manager.handleAppWillTerminate()
+
+        XCTAssertEqual(
+            recorder.argvList,
+            [["/usr/bin/shortcuts", "run", "Restly 专注关闭"]],
+            "enable 还在飞时退出也要发同步关闭（关闭幂等，宁可多发不可漏发）"
+        )
     }
 
     // MARK: - 名字可配置

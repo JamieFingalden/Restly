@@ -361,17 +361,24 @@ final class PomodoroManager: ObservableObject {
         let bridge = focusModeBridge
         let engaged = shouldEngage
         Task { @MainActor in
+            // 乐观置位：指令已发起（哪怕结果未回）就按已应用记账 ——
+            // 「刚开专注就退出 app」的场景里，若按「结果回没回」判定，
+            // willTerminate 会因 applied=false 跳过关闭，enable 却在
+            // 退出后跑完，专注模式被留开。关闭指令幂等（对未开启的
+            // 模式执行关闭无害），宁可多发不可漏发；失败在此回滚，
+            // 下一轮结算自然重试。
+            self.isFocusLinkApplied = engaged
             let result = await bridge.setFocusEngaged(engaged)
             switch result {
             case .success(()):
-                self.isFocusLinkApplied = engaged
+                break  // 已记账，落袋。
             case .failure(.missing):
+                self.isFocusLinkApplied = !engaged
                 self.presentFocusLinkageMissingToast()
-                // applied 不推进：熔断复位的重跑会补上这笔。
             case .failure(.failed), .failure(.noFocusTarget):
+                self.isFocusLinkApplied = !engaged
                 // 其它失败 bridge 已留痕：不动状态、不弹框，
                 // 下一次结算（流转或复位钩子）自然会重试。
-                break
             }
         }
     }
@@ -396,6 +403,9 @@ final class PomodoroManager: ObservableObject {
     /// willTerminate 里异步起一个进程没问题 —— 子进程独立存活，
     /// 不等它退出。
     func handleAppWillTerminate() {
+        // applied 是乐观记账：指令发起即置位（见 syncFocusLinkage），
+        // 所以「刚开专注就退出」的在飞开启也会走到这里。关闭指令
+        // 幂等，宁可多发不可漏发。
         guard isFocusLinkApplied else { return }
         isFocusLinkDesired = false
         isFocusLinkApplied = false

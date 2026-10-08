@@ -66,6 +66,9 @@ final class FocusModeBridge: ObservableObject {
         case opened
         case generationFailed(String)
         case openFailed(String)
+        /// 用户在流程中途取消：已跳过剩余的外部副作用，
+        /// 未打开的临时文件已清。
+        case cancelled
     }
 
     /// 一键创建用的专注模式目标：reverse-DNS 的 modeIdentifier 是
@@ -295,7 +298,13 @@ final class FocusModeBridge: ObservableObject {
         //（实测：App 退出时签名必失败，报错误导人的「格式不正确」）
         // —— 签名前先把它拉起来；首签失败再补一次拉起 + 重试。
         await ensureAppRunning()
+        var openedCount = 0
         for file in files {
+            if Task.isCancelled {
+                // 取消后不得再有外部副作用：没签的不再签，没开的不再开。
+                cancelRemainder(of: files, openedCount: openedCount)
+                return .cancelled
+            }
             if await signShortcutFile(at: file) != nil {
                 // 首签失败常见于 App 还没就绪：补一次拉起再试，仍败才报。
                 DebugEventLog.shared.log("联动安装：「\(file.lastPathComponent)」首签失败，补拉 App 后重试")
@@ -308,6 +317,10 @@ final class FocusModeBridge: ObservableObject {
             }
             DebugEventLog.shared.log("联动安装：「\(file.lastPathComponent)」已签名")
         }
+        if Task.isCancelled {
+            cancelRemainder(of: files, openedCount: openedCount)
+            return .cancelled
+        }
         DebugEventLog.shared.log("联动安装：打开「\(currentNames.on).shortcut」")
         guard openHandler(files[0]) else {
             DebugEventLog.shared.log("联动安装：打开「\(currentNames.on).shortcut」失败")
@@ -315,9 +328,15 @@ final class FocusModeBridge: ObservableObject {
             NSLog("Restly 无法打开快捷指令文件：\(files[0].path)")
             return .openFailed("无法打开「\(currentNames.on).shortcut」")
         }
+        openedCount = 1
         if interOpenDelay > 0 {
             // 两个预览叠在一起会互相抢占前台，中间留一秒。
             try? await Task.sleep(for: .seconds(interOpenDelay))
+        }
+        if Task.isCancelled {
+            // 第一条已经交出去（预览归系统管），只清还没打开的。
+            cancelRemainder(of: files, openedCount: openedCount)
+            return .cancelled
         }
         DebugEventLog.shared.log("联动安装：打开「\(currentNames.off).shortcut」")
         guard openHandler(files[1]) else {
@@ -328,6 +347,15 @@ final class FocusModeBridge: ObservableObject {
         }
         DebugEventLog.shared.log("联动安装：两个文件都已交给系统，等待用户确认导入")
         return .opened
+    }
+
+    /// 取消后的收尾：只清尚未交给系统的剩余文件（已打开的预览归
+    /// 系统管，删了会让预览失效）。
+    private func cancelRemainder(of files: [URL], openedCount: Int) {
+        DebugEventLog.shared.log("联动安装：检测到取消，跳过剩余步骤")
+        for file in files.dropFirst(openedCount) {
+            try? FileManager.default.removeItem(at: file)
+        }
     }
 
     /// 就地签名：`shortcuts sign`（默认 people-who-know-me 模式，无网络
@@ -671,7 +699,8 @@ final class FocusModeBridge: ObservableObject {
 
     /// 默认执行器：串行后台队列上起进程并等它退出 —— 排队即串行，
     /// 同一时刻最多一个 shortcuts 进程；主线程只负责收结果。
-    private static func defaultRunner(workQueue: DispatchQueue) -> ProcessRunner {
+    /// internal 只为测试：直测「大输出不死锁」的并发消费契约。
+    nonisolated static func defaultRunner(workQueue: DispatchQueue) -> ProcessRunner {
         return { arguments, completion in
             workQueue.async {
                 let process = Process()
@@ -690,15 +719,32 @@ final class FocusModeBridge: ObservableObject {
                     }
                     return
                 }
-                process.waitUntilExit()
-                // stdout + stderr 合并收一份：list 的名字和报错文案都在里面。
-                // 输出量远小于管道缓冲（几千行名字才写满），等退出后一次读
-                // 没有竞态。
-                let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
 
+                // 必须先并发消费管道、后等退出：子进程输出超过 64KB 管道
+                // 缓冲会写阻塞，先 waitUntilExit 的话两边互相等到天荒地老
+                // —— 串行队列上这条命令永远占位，后面所有联动指令全部
+                // 排队到重启（用户指认的指令可以输出文本/图片/文件，
+                // 不只我们自己的 list）。读取线程阻塞到 EOF，与
+                // waitUntilExit 在 group.wait 汇合成一个 join 点，无竞态。
+                final class OutputBuffer: @unchecked Sendable {
+                    var data = Data()
+                }
+                let buffer = OutputBuffer()
+                let group = DispatchGroup()
+                group.enter()
+                DispatchQueue.global().async {
+                    buffer.data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+                process.waitUntilExit()
+                group.wait()
+
+                // stdout + stderr 合并收一份：list 的名字和报错文案都在
+                // 里面，失败时输出继续用于诊断。
+                let text = String(decoding: buffer.data, as: UTF8.self)
                 let status = process.terminationStatus
                 DispatchQueue.main.async {
-                    completion(status, output)
+                    completion(status, text)
                 }
             }
         }
