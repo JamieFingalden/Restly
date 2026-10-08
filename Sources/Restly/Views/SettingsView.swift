@@ -4,14 +4,14 @@ struct SettingsView: View {
     @ObservedObject var settings: ReminderSettings
     @ObservedObject var manager: ReminderManager
     @ObservedObject var launchAtLoginManager: LaunchAtLoginManager
-    let focusModeBridge: FocusModeBridge
+    /// bridge 是执行侧与设置页共用的事实来源（@Published 存在性结论）：
+    /// 执行层发现指令没了，footer 不能还绿着。
+    @ObservedObject var focusModeBridge: FocusModeBridge
     @State private var selectedSection = SettingsSection.reminders
 
     // MARK: 专注模式联动的界面状态
-    // 安装是否完成、快捷指令是否就位都只有系统能回答，视图只存结论。
-    // nil = 还没查过（检测中）；失败一律落到 installSheet / linkageStatus，
-    // 不再有任何静默路径 —— 开关弹回又毫无提示曾让用户以为功能是坏的。
-    @State private var linkageStatus: FocusModeBridge.Existence?
+    // 是否就位的结论由 bridge @Published 发布（执行侧检测也会更新它），
+    // 视图只持有「正在检测」这个本地过程态与安装 sheet 的阶段性状态。
     @State private var isCheckingLinkage = false
     @State private var showCreationChoice = false
     @State private var installSheet: FocusLinkageInstallSheetState?
@@ -35,7 +35,10 @@ struct SettingsView: View {
         .frame(width: 600, height: 590)
         .onAppear {
             launchAtLoginManager.refresh()
-            refreshLinkageStatusIfEnabled()
+            // 设置窗口每次出现都强制重检：窗口可能开着跨越用户删指令，
+            // 旧结论哪怕一分钟前刚查过也会撒谎。设置页不是常驻界面，
+            // 每次出现多跑一次 list 可以接受。
+            refreshLinkageStatusIfEnabled(force: true)
         }
         .confirmationDialog(
             "快捷指令还没就绪",
@@ -109,13 +112,13 @@ struct SettingsView: View {
         )
     }
 
-    /// 开关行常驻的状态副标题：只要开关开着就显示真实状态 ——
-    /// 检测中 / 已就绪 / 未检测到（点名 + 可点的重建入口）。
-    /// 曾把失败分支藏在设置值后面，失败时反而什么都不显示。
+    /// 开关行常驻的状态副标题：结论直接读 bridge 的发布状态（执行侧
+    /// 检测缺失会实时把它打成红色），绝不本地缓存撒谎；底下挂检测
+    /// 时间与手动重检 —— 窗口开很久时用户自己决定要不要再问一次。
     @ViewBuilder
     private var linkageStatusFooter: some View {
         if settings.pomodoroLinksFocusMode {
-            if isCheckingLinkage || linkageStatus == nil {
+            if isCheckingLinkage {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.mini)
@@ -123,22 +126,11 @@ struct SettingsView: View {
                         .font(.system(size: 12, design: .rounded))
                         .foregroundStyle(.secondary)
                 }
-            } else if linkageStatus == .ready {
-                Label("快捷指令已就绪，专注计时将自动开关专注模式。", systemImage: "checkmark.seal.fill")
-                    .font(.system(size: 12, design: .rounded))
-                    .foregroundStyle(.green.opacity(0.85))
             } else {
-                Button {
-                    showCreationChoice = true
-                } label: {
-                    Label(
-                        "未检测到「\(settings.resolvedFocusLinkOnName)」「\(settings.resolvedFocusLinkOffName)」，点击重新走创建流程。",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.system(size: 12, design: .rounded))
-                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    linkageConclusionLabel
+                    linkageFreshnessRow
                 }
-                .buttonStyle(.plain)
             }
         } else {
             Label(
@@ -150,6 +142,56 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private var linkageConclusionLabel: some View {
+        switch focusModeBridge.lastKnownExistence {
+        case .ready:
+            Label("快捷指令已就绪，专注计时将自动开关专注模式。", systemImage: "checkmark.seal.fill")
+                .font(.system(size: 12, design: .rounded))
+                .foregroundStyle(.green.opacity(0.85))
+        case .missing:
+            Button {
+                showCreationChoice = true
+            } label: {
+                Label(
+                    "未检测到「\(settings.resolvedFocusLinkOnName)」「\(settings.resolvedFocusLinkOffName)」，点击重新走创建流程。",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.system(size: 12, design: .rounded))
+                .foregroundStyle(.orange)
+            }
+            .buttonStyle(.plain)
+        case .unknown, nil:
+            Button {
+                Task { await refreshLinkageStatus(force: true) }
+            } label: {
+                Label("尚未确认快捷指令状态，点击立即检测。", systemImage: "questionmark.circle")
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var linkageFreshnessRow: some View {
+        HStack(spacing: 6) {
+            if let date = focusModeBridge.lastExistenceCheckDate {
+                Text("上次检测 \(date.formatted(date: .omitted, time: .shortened))")
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundStyle(.tertiary)
+            }
+            Button {
+                Task { await refreshLinkageStatus(force: true) }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .help("重新检测")
+            Spacer()
+        }
+    }
+
     /// 名字指认区：允许手输，也能从一次 `shortcuts list` 的结果里选。
     /// 只有开关开着（或正要引导创建）才值得花这一个进程去拿名单。
     @ViewBuilder
@@ -158,7 +200,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 shortcutNameRow(
                     title: "开启指令",
-                    placeholder: FocusModeBridge.defaultOnShortcutName,
+                    placeholder: "默认：\(FocusModeBridge.defaultOnShortcutName)",
                     binding: Binding(
                         get: { settings.focusLinkOnShortcutName },
                         set: { settings.focusLinkOnShortcutName = $0 }
@@ -166,7 +208,7 @@ struct SettingsView: View {
                 )
                 shortcutNameRow(
                     title: "关闭指令",
-                    placeholder: FocusModeBridge.defaultOffShortcutName,
+                    placeholder: "默认：\(FocusModeBridge.defaultOffShortcutName)",
                     binding: Binding(
                         get: { settings.focusLinkOffShortcutName },
                         set: { settings.focusLinkOffShortcutName = $0 }
@@ -233,7 +275,6 @@ struct SettingsView: View {
         guard !isCheckingLinkage else { return }
         isCheckingLinkage = true
         let existence = await focusModeBridge.checkShortcutsExist(forceRefresh: force)
-        linkageStatus = existence
         isCheckingLinkage = false
         if autoGuideOnMissing, existence != .ready {
             showCreationChoice = true
@@ -261,11 +302,9 @@ struct SettingsView: View {
                 break
             case .generationFailed(let reason):
                 installSheet = .generationFailed(reason)
-                linkageStatus = .missing
                 return
             case .openFailed(let reason):
                 installSheet = .openFailed(reason)
-                linkageStatus = .missing
                 return
             }
 
@@ -277,13 +316,11 @@ struct SettingsView: View {
                 if Task.isCancelled { return }
                 elapsed += Int(Self.installPollInterval)
                 if await focusModeBridge.confirmInstalled() {
-                    linkageStatus = .ready
                     installSheet = nil
                     return
                 }
             }
             installSheet = .timedOut
-            linkageStatus = .missing
         }
     }
 
@@ -591,9 +628,26 @@ struct SettingsView: View {
     }
 
     private var appVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
+        AppVersionText.displayText(
+            shortVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+            buildVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        )
     }
 
+}
+
+/// 设置页标着「0.2.0 (23)」才分得清手里跑的是哪次构建 ——
+/// 短版本号在多次构建之间经常不变。从 Bundle 读，两端都可能缺
+/// （swift run 开发态没有 Info.plist），各自兜底。
+enum AppVersionText {
+    static func displayText(shortVersion: String?, buildVersion: String?) -> String {
+        switch (shortVersion, buildVersion) {
+        case let (short?, build?): return "\(short) (\(build))"
+        case let (short?, nil): return short
+        case let (nil, build?): return "开发版 (\(build))"
+        default: return "开发版"
+        }
+    }
 }
 
 private enum SettingsSection: String, CaseIterable, Identifiable {
@@ -861,7 +915,7 @@ private struct FocusLinkageTutorialView: View {
             }
 
             Label(
-                "导入或创建后，可以把动作里的专注模式改成任何你想要的模式，名字保持不变即可。",
+                "导入后请点开动作确认目标专注模式已选中（系统内置模式按本地化名字匹配，可能有出入）；也可以换成任何你想要的模式，名字保持不变即可。",
                 systemImage: "info.circle"
             )
             .font(.system(size: 12, design: .rounded))

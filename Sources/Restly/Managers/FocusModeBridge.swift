@@ -94,12 +94,25 @@ final class FocusModeBridge: ObservableObject {
     /// 预览互相抢占前台，中间留一秒让用户处理完第一条。
     private let interOpenDelay: TimeInterval
 
+    /// 签名前拉起快捷指令 App（sign 走它的 XPC 服务）。可注入：
+    /// 测试里数调用、不真拉 App。
+    typealias AppRunningEnsurer = () async -> Void
+
     private let runner: ProcessRunner
+    private let ensureAppRunning: AppRunningEnsurer
     private let workQueue = DispatchQueue(label: "com.restly.focus-mode-bridge")
 
     /// 一旦确认缺失就停止后续 run：用户删除快捷指令后，每次状态流转
     /// 都白起一个进程毫无意义，重建成功（或下次启动）才复位。
     private(set) var isMissing = false
+
+    /// 最近一次存在性结论，执行侧与设置页共用同一份事实 ——
+    /// 执行层已经知道指令没了，设置页不能还挂着旧的绿色「已就绪」。
+    /// 只有 ready/missing 算结论，unknown 不覆盖旧值。
+    @Published private(set) var lastKnownExistence: Existence?
+    /// 最近一次真的问过系统（跑了 list）的时刻。缓存命中不算 ——
+    /// 设置页的「上次检测」要反映数据的新鲜度。
+    @Published private(set) var lastExistenceCheckDate: Date?
 
     /// 缓存连同当时的名字一起存：用户改指认名字后旧结论一律作废。
     private var existenceCache: (names: ShortcutNames, result: Existence, timestamp: Date)?
@@ -112,7 +125,8 @@ final class FocusModeBridge: ObservableObject {
         focusTargetProvider: @escaping () -> FocusTarget? = FocusModeBridge.readFocusTargetFromSystem,
         existenceCacheTTL: TimeInterval = 60,
         openHandler: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
-        interOpenDelay: TimeInterval = 1.0
+        interOpenDelay: TimeInterval = 1.0,
+        ensureAppRunning: @escaping AppRunningEnsurer = FocusModeBridge.wakeShortcutsAppInBackground
     ) {
         self.runner = runner ?? Self.defaultRunner(workQueue: workQueue)
         self.namesProvider = namesProvider
@@ -120,6 +134,21 @@ final class FocusModeBridge: ObservableObject {
         self.existenceCacheTTL = existenceCacheTTL
         self.openHandler = openHandler
         self.interOpenDelay = interOpenDelay
+        self.ensureAppRunning = ensureAppRunning
+    }
+
+    /// 后台拉起快捷指令 App（不抢焦点），再留一秒余量等它的 XPC
+    /// 服务可用 —— sign 依赖 App 在跑，否则报误导性的「格式不正确」。
+    nonisolated static func wakeShortcutsAppInBackground() async {
+        let url = URL(fileURLWithPath: "/System/Applications/Shortcuts.app")
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        do {
+            try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        } catch {
+            NSLog("Restly 唤起快捷指令 App 失败：\(error.localizedDescription)")
+        }
+        try? await Task.sleep(for: .seconds(1))
     }
 
     /// 当前生效的两条指令名字。每次现取 —— 设置里改完立刻生效，
@@ -159,12 +188,16 @@ final class FocusModeBridge: ObservableObject {
             return cache.result
         }
 
-        guard let available = await listShortcutNames() else { return .unknown }
+        guard let available = await listShortcutNames() else {
+            recordExistence(.unknown)
+            return .unknown
+        }
         let present = Set(available)
         let result: Existence = present.isSuperset(of: [currentNames.on, currentNames.off])
             ? .ready
             : .missing
         existenceCache = (currentNames, result, Date())
+        recordExistence(result)
         return result
     }
 
@@ -210,11 +243,18 @@ final class FocusModeBridge: ObservableObject {
         guard files.count == 2 else {
             return .generationFailed("生成结果不完整（\(files.count) 个文件）")
         }
-        // 快捷指令 App 拒收未签名文件（实测）：两个都先 sign，再依次打开。
+        // 快捷指令 App 拒收未签名文件，而 sign 又依赖 App 在跑
+        //（实测：App 退出时签名必失败，报错误导人的「格式不正确」）
+        // —— 签名前先把它拉起来；首签失败再补一次拉起 + 重试。
+        await ensureAppRunning()
         for file in files {
-            if let failure = await signShortcutFile(at: file) {
-                cleanupTemporaryFiles(files)
-                return .generationFailed(failure)
+            if await signShortcutFile(at: file) != nil {
+                // 首签失败常见于 App 还没就绪：补一次拉起再试，仍败才报。
+                await ensureAppRunning()
+                if let retryFailure = await signShortcutFile(at: file) {
+                    cleanupTemporaryFiles(files)
+                    return .generationFailed(retryFailure)
+                }
             }
         }
         guard openHandler(files[0]) else {
@@ -374,10 +414,31 @@ final class FocusModeBridge: ObservableObject {
         )
     }
 
-    /// 挑选规则：优先名字带「专注 / Focus / Work / 工作」的自定义模式
-    /// （有自定义模式说明用户真的在用专注模式工作），否则退到系统自带
-    /// 的「勿扰模式」—— 它在每个 macOS 上都存在。
-    nonisolated static func readFocusTarget(at url: URL) -> FocusTarget? {
+    /// 系统内置模式的 modeIdentifier。它们的 name 是英文规范名，
+    /// 运行时按本地化显示名匹配会对不上；用户自建模式的名字是自己
+    /// 起的，没有这个问题 —— 挑目标时优先绕开系统内置。
+    nonisolated static let systemModeIdentifiers: Set<String> = [
+        "com.apple.donotdisturb.mode.default",
+        "com.apple.sleep.sleep-mode",
+        "com.apple.donotdisturb.mode.driving",
+        "com.apple.donotdisturb.mode.personal",
+        "com.apple.donotdisturb.mode.work",
+        "com.apple.donotdisturb.mode.mindfulness",
+        "com.apple.donotdisturb.mode.fitness",
+        "com.apple.donotdisturb.mode.gaming",
+        "com.apple.donotdisturb.mode.reading",
+    ]
+
+    /// 挑选规则（层层兜底）：
+    /// 1. 名字带「专注 / Focus / Work / 工作」—— 用户的意图明写在那里；
+    /// 2. 任何用户自建模式 —— 名字天然本地化无歧义（实测 "learn" 可用）；
+    /// 3. 系统勿扰模式兜底 —— 但 DisplayString 必须写本地化显示名
+    ///   （实测写规范名 "Do Not Disturb" 在中文系统上运行时报
+    ///   「不存在名为…的专注模式」），映射不到就原样写并靠教程提示。
+    nonisolated static func readFocusTarget(
+        at url: URL,
+        preferredLanguages: [String] = Locale.preferredLanguages
+    ) -> FocusTarget? {
         guard let data = try? Data(contentsOf: url),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let entries = object["data"] as? [[String: Any]] else {
@@ -401,15 +462,64 @@ final class FocusModeBridge: ObservableObject {
         if let preferred = modes.first(where: { preferredNames.contains($0.displayName) }) {
             return preferred
         }
-        return modes.first { $0.identifier == "com.apple.donotdisturb.mode.default" }
+        if let custom = modes.first(where: { !systemModeIdentifiers.contains($0.identifier) }) {
+            return custom
+        }
+        guard let dnd = modes.first(where: { $0.identifier == "com.apple.donotdisturb.mode.default" }) else {
+            return nil
+        }
+        let displayName = localizedDoNotDisturbName(preferredLanguages: preferredLanguages)
+            ?? dnd.displayName
+        return FocusTarget(identifier: dnd.identifier, displayName: displayName)
+    }
+
+    /// 系统勿扰模式的本地化显示名（运行时按它匹配）。按用户首选语言
+    /// 找不到映射时返回 nil，让调用方退回规范名。
+    nonisolated static func localizedDoNotDisturbName(
+        preferredLanguages: [String] = Locale.preferredLanguages
+    ) -> String? {
+        for language in preferredLanguages {
+            // 中文要区分简繁（zh-Hans / zh-Hant），其余语言取首段即可。
+            let parts = language.split(separator: "-")
+            let code: String
+            if parts.first == "zh" {
+                code = parts.prefix(2).joined(separator: "-")
+            } else {
+                code = String(parts.first ?? "")
+            }
+            switch code {
+            case "zh-Hans": return "勿扰模式"
+            case "zh-Hant": return "勿擾模式"
+            case "ja": return "おやすみモード"
+            case "ko": return "방해 금지 모드"
+            case "en": return "Do Not Disturb"
+            case "fr": return "Ne pas déranger"
+            case "de": return "Nicht stören"
+            case "es": return "No molestar"
+            case "ru": return "Не беспокоить"
+            case "pt": return "Não Perturbar"
+            case "it": return "Non disturbare"
+            default: continue
+            }
+        }
+        return nil
     }
 
     // MARK: - 进程执行
 
     private func markMissing() {
         isMissing = true
+        lastKnownExistence = .missing
+        lastExistenceCheckDate = Date()
         let currentNames = names
         NSLog("Restly 未检测到快捷指令「\(currentNames.on)」「\(currentNames.off)」，联动停止重试，直到重新创建。")
+    }
+
+    private func recordExistence(_ result: Existence) {
+        lastExistenceCheckDate = Date()
+        if result != .unknown {
+            lastKnownExistence = result
+        }
     }
 
     private func run(_ arguments: [String]) async -> (Int32, String) {

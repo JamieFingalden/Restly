@@ -53,6 +53,12 @@ final class FocusModeLinkageTests: XCTestCase {
         }
     }
 
+    /// 记录 bridge 拉起快捷指令 App 的次数。
+    private final class AppWakeCounter: @unchecked Sendable {
+        private(set) var count = 0
+        func record() { count += 1 }
+    }
+
     @MainActor
     private func makeDefaults(enablingLinkage: Bool = false) -> (UserDefaults, String) {
         let suiteName = "FocusModeLinkageTests.\(UUID().uuidString)"
@@ -75,14 +81,16 @@ final class FocusModeLinkageTests: XCTestCase {
             displayName: "Do Not Disturb"
         ),
         openHandler: @escaping (URL) -> Bool = { _ in true },
-        interOpenDelay: TimeInterval = 0
+        interOpenDelay: TimeInterval = 0,
+        appWakeCount: AppWakeCounter? = nil
     ) -> FocusModeBridge {
         FocusModeBridge(
             runner: runner,
             namesProvider: { names },
             focusTargetProvider: { target },
             openHandler: openHandler,
-            interOpenDelay: interOpenDelay
+            interOpenDelay: interOpenDelay,
+            ensureAppRunning: { appWakeCount?.record() }
         )
     }
 
@@ -281,6 +289,46 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertTrue(manager.hasShownFocusLinkageWarning)
     }
 
+    // MARK: - 状态发布（设置页与执行侧共用事实）
+
+    /// 执行层确认缺失时必须把结论广播出去 —— 设置页开着时不能
+    /// 还挂着旧的绿色「已就绪」。
+    @MainActor
+    func testMissingExecutionUpdatesPublishedStateForOpenSettings() async {
+        let stub = RunnerStub(responses: [
+            (1, "找不到快捷指令"),   // run 失败
+            (0, ""),                // list：缺失
+        ])
+        let bridge = makeBridge(runner: stub.runner)
+        XCTAssertNil(bridge.lastKnownExistence, "没查过就不该有结论")
+
+        _ = await bridge.setFocusEngaged(true)
+
+        XCTAssertEqual(bridge.lastKnownExistence, .missing)
+        XCTAssertNotNil(bridge.lastExistenceCheckDate)
+    }
+
+    /// unknown（连 list 都没跑成）不覆盖旧结论，但检测时间要刷新 ——
+    /// 时间戳是用户判断「这条结论多新鲜」的依据。
+    @MainActor
+    func testUnknownCheckKeepsPreviousConclusionButRefreshesDate() async {
+        let stub = RunnerStub(responses: [
+            (0, "A\nB\n"),   // list：就绪
+            (1, "boom"),      // 强制重检时 list 失败
+        ])
+        let bridge = makeBridge(runner: stub.runner, names: .init(on: "A", off: "B"))
+
+        _ = await bridge.checkShortcutsExist()
+        XCTAssertEqual(bridge.lastKnownExistence, .ready)
+        let firstDate = bridge.lastExistenceCheckDate
+
+        let second = await bridge.checkShortcutsExist(forceRefresh: true)
+
+        XCTAssertEqual(second, .unknown)
+        XCTAssertEqual(bridge.lastKnownExistence, .ready, "unknown 不覆盖旧结论")
+        XCTAssertNotEqual(bridge.lastExistenceCheckDate, firstDate)
+    }
+
     // MARK: - 名字可配置
 
     /// 用户手动建的指令（名字与出厂默认不同）按名字指认后必须能被
@@ -423,18 +471,17 @@ final class FocusModeLinkageTests: XCTestCase {
     @MainActor
     func testInstallMapsSignFailureToGenerationFailedAndNeverOpens() async {
         let stub = RunnerStub(responses: [
-            (2, "无法验证或签名"),   // 第一条就签失败
+            (2, "无法验证或签名"),   // 第一条首签失败
+            (2, "无法验证或签名"),   // 拉起 App 后重试仍失败
         ])
         var opened: [String] = []
-        var signSourcePath: String?
+        let wake = AppWakeCounter()
         let bridge = makeBridge(
             runner: stub.runner,
             names: .init(on: "设定专注模式", off: "关闭专注模式"),
-            openHandler: { opened.append($0.lastPathComponent); return true }
+            openHandler: { opened.append($0.lastPathComponent); return true },
+            appWakeCount: wake
         )
-        // 借 openHandler 拿不到（不会走到），从 sign 的 argv 记下源路径。
-        // 直接包装 runner 前先记：简单起见在断言阶段从 stub 里取。
-        defer { _ = signSourcePath }
 
         let outcome = await bridge.installShortcuts()
 
@@ -444,13 +491,27 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertTrue(reason.contains("2"), "reason 要带退出码：\(reason)")
         XCTAssertTrue(reason.contains("无法验证或签名"), "reason 要带输出：\(reason)")
         XCTAssertTrue(opened.isEmpty, "签名失败绝不能再交给系统打开")
-        XCTAssertEqual(stub.invocations.filter { $0.command == "sign" }.count, 1, "第一条失败即止，不签第二条")
-
+        let signs = stub.invocations.filter { $0.command == "sign" }
+        XCTAssertEqual(signs.count, 2, "首条签两次（重试一次）即止，不碰第二条")
+        XCTAssertEqual(wake.count, 2, "初始拉起 + 重试前补拉，共两次")
         // 失败后临时目录要清干净：sign 的源文件应已不存在。
-        signSourcePath = stub.invocations.first { $0.command == "sign" }?.argv[2]
-        if let path = signSourcePath {
+        if let path = signs.first?.argv[2] {
             XCTAssertFalse(FileManager.default.fileExists(atPath: path), "半成品不该留在临时目录")
         }
+    }
+
+    @MainActor
+    func testInstallWakesShortcutsAppBeforeSigning() async {
+        let stub = RunnerStub()
+        let wake = AppWakeCounter()
+        let bridge = makeBridge(runner: stub.runner, appWakeCount: wake)
+
+        let outcome = await bridge.installShortcuts()
+
+        XCTAssertEqual(outcome, .opened)
+        let firstSignIndex = stub.invocations.firstIndex { $0.command == "sign" }
+        XCTAssertNotNil(firstSignIndex)
+        XCTAssertGreaterThanOrEqual(wake.count, 1, "签名前要先拉起快捷指令 App")
     }
 
     // MARK: - FocusModeBridge 本体
@@ -588,7 +649,9 @@ final class FocusModeLinkageTests: XCTestCase {
 
     // MARK: - 专注模式目标解析
 
-    func testFocusTargetParsingPrefersFocusLikeNames() throws {
+    /// 名字表没命中时优先挑用户自建模式：名字是用户起的，运行时
+    /// 按显示名匹配不会踩本地化坑（系统内置的英文名会踩）。
+    func testFocusTargetParsingPrefersFocusLikeNamesThenCustomModes() throws {
         let fixture = """
         {"data": [{"modeConfigurations": {
             "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}},
@@ -601,8 +664,46 @@ final class FocusModeLinkageTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
 
         let target = try XCTUnwrap(FocusModeBridge.readFocusTarget(at: url))
-        XCTAssertEqual(target.identifier, "com.apple.donotdisturb.mode.default")
-        // 名字表（专注/Focus/Work/工作）都没有时退回系统勿扰，别乱挑。
+        XCTAssertEqual(target.identifier, "com.apple.focus.learn", "用户自建模式优先于系统内置兜底")
+        XCTAssertEqual(target.displayName, "learn")
+    }
+
+    /// 只剩系统勿扰可兜底时，DisplayString 用本地化显示名 ——
+    /// 运行时按显示名匹配，写规范英文名在中文系统上会找不到。
+    func testFocusTargetFallsBackToLocalizedDoNotDisturb() throws {
+        let fixture = """
+        {"data": [{"modeConfigurations": {
+            "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}}
+        }}]}
+        """
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-\(UUID().uuidString).json")
+        try fixture.data(using: .utf8)!.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let chinese = try XCTUnwrap(
+            FocusModeBridge.readFocusTarget(at: url, preferredLanguages: ["zh-Hans-CN"])
+        )
+        XCTAssertEqual(chinese.identifier, "com.apple.donotdisturb.mode.default")
+        XCTAssertEqual(chinese.displayName, "勿扰模式")
+
+        let english = try XCTUnwrap(
+            FocusModeBridge.readFocusTarget(at: url, preferredLanguages: ["en-US"])
+        )
+        XCTAssertEqual(english.displayName, "Do Not Disturb")
+
+        let unmapped = try XCTUnwrap(
+            FocusModeBridge.readFocusTarget(at: url, preferredLanguages: ["xx-YY"])
+        )
+        XCTAssertEqual(unmapped.displayName, "Do Not Disturb", "映射不到退回规范名，靠教程提示兜底")
+    }
+
+    func testLocalizedDoNotDisturbCoversMajorLanguages() {
+        XCTAssertEqual(FocusModeBridge.localizedDoNotDisturbName(preferredLanguages: ["zh-Hans-CN"]), "勿扰模式")
+        XCTAssertEqual(FocusModeBridge.localizedDoNotDisturbName(preferredLanguages: ["zh-Hant-TW"]), "勿擾模式")
+        XCTAssertEqual(FocusModeBridge.localizedDoNotDisturbName(preferredLanguages: ["ja-JP"]), "おやすみモード")
+        XCTAssertEqual(FocusModeBridge.localizedDoNotDisturbName(preferredLanguages: ["en-US"]), "Do Not Disturb")
+        XCTAssertNil(FocusModeBridge.localizedDoNotDisturbName(preferredLanguages: ["xx-YY", "zz-ZZ"]))
     }
 
     func testFocusTargetParsingFallsBackToDNDThenNil() throws {

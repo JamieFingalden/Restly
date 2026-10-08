@@ -133,27 +133,35 @@ final class ReminderSettingsTests: XCTestCase {
         XCTAssertEqual(changes, Array(repeating: .other, count: 10))
     }
 
-    /// 联动指令名字：出厂默认两条常量名，用户指认后持久化；
-    /// 清空/纯空白回退默认 —— 输入框清空不该让联动去找空名字。
+    /// 联动指令名字：空 = 跟随默认（存档里绝不出现「默认值伪装成
+    /// 用户指认」），输入才落盘且去掉首尾空白；清空删键回退默认。
     @MainActor
-    func testFocusLinkShortcutNamesDefaultPersistAndFallBack() {
+    func testFocusLinkShortcutNamesClearDoesNotPersistDefault() {
         let (settings, suiteName, defaults) = makeSettings()
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        XCTAssertEqual(settings.focusLinkOnShortcutName, FocusModeBridge.defaultOnShortcutName)
-        XCTAssertEqual(settings.focusLinkOffShortcutName, FocusModeBridge.defaultOffShortcutName)
+        // 出厂（无存档键）：字段为空、取值口径回退默认。
+        XCTAssertEqual(settings.focusLinkOnShortcutName, "")
         XCTAssertEqual(settings.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
         XCTAssertEqual(settings.resolvedFocusLinkOffName, FocusModeBridge.defaultOffShortcutName)
+        XCTAssertNil(defaults.string(forKey: "focusLinkOnShortcutName"))
 
+        // 指认：去空白后落盘，读回一致。
         settings.focusLinkOnShortcutName = "  设定专注模式  "
         settings.focusLinkOffShortcutName = "关闭专注模式"
-
+        XCTAssertEqual(defaults.string(forKey: "focusLinkOnShortcutName"), "设定专注模式")
+        XCTAssertEqual(defaults.string(forKey: "focusLinkOffShortcutName"), "关闭专注模式")
         let reloaded = ReminderSettings(defaults: defaults)
         XCTAssertEqual(reloaded.resolvedFocusLinkOnName, "设定专注模式")
         XCTAssertEqual(reloaded.resolvedFocusLinkOffName, "关闭专注模式")
 
+        // 清空：删键，不落默认值；取值口径回退默认，重开也是空字段。
         reloaded.focusLinkOnShortcutName = "   "
+        XCTAssertNil(defaults.string(forKey: "focusLinkOnShortcutName"), "清空不该把默认名写进存档")
         XCTAssertEqual(reloaded.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
+        let reloadedAgain = ReminderSettings(defaults: defaults)
+        XCTAssertEqual(reloadedAgain.focusLinkOnShortcutName, "")
+        XCTAssertEqual(reloadedAgain.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
     }
 
     /// 联动开关的翻转走独立回调（PomodoroManager 靠它立刻执行
@@ -176,5 +184,16 @@ final class ReminderSettingsTests: XCTestCase {
 
         settings.pomodoroLinksFocusMode = false
         XCTAssertEqual(notifications, 1)
+    }
+}
+
+/// 设置页版本徽标的拼装规则：构建号是分辨「手里跑的是不是新版」的
+/// 唯一凭据（短版本号在多次构建间经常不变），两端都可能缺。
+final class AppVersionTextTests: XCTestCase {
+    func testVersionDisplayTextCombinations() {
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: "0.2.0", buildVersion: "23"), "0.2.0 (23)")
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: "0.2.0", buildVersion: nil), "0.2.0")
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: nil, buildVersion: "23"), "开发版 (23)")
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: nil, buildVersion: nil), "开发版")
     }
 }

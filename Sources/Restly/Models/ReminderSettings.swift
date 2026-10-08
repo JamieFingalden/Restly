@@ -92,13 +92,13 @@ final class ReminderSettings: ObservableObject {
 
     /// 联动依赖的两条快捷指令的名字。名字是 Restly 调用它们的唯一凭据，
     /// 而用户可能早就手动建过名字不同的两条（比如「设定专注模式」）——
-    /// 与其逼人重建，不如让设置迁就现状。
+    /// 与其逼人重建，不如让设置迁就现状。落盘规则见 storeShortcutName。
     @Published var focusLinkOnShortcutName: String {
-        didSet { persist(focusLinkOnShortcutName, forKey: Keys.focusLinkOnShortcutName, change: .other) }
+        didSet { storeShortcutName(focusLinkOnShortcutName, key: Keys.focusLinkOnShortcutName) }
     }
 
     @Published var focusLinkOffShortcutName: String {
-        didSet { persist(focusLinkOffShortcutName, forKey: Keys.focusLinkOffShortcutName, change: .other) }
+        didSet { storeShortcutName(focusLinkOffShortcutName, key: Keys.focusLinkOffShortcutName) }
     }
 
     /// 与 macOS 专注模式联动。默认关闭 —— 依赖用户自己装的两条快捷指令，
@@ -141,10 +141,11 @@ final class ReminderSettings: ObservableObject {
         pomodoroAutoStartBreak = defaults.object(forKey: Keys.pomodoroAutoStartBreak) as? Bool ?? true
         pomodoroAutoStartFocus = defaults.object(forKey: Keys.pomodoroAutoStartFocus) as? Bool ?? false
         pomodoroShowsInMenuBar = defaults.object(forKey: Keys.pomodoroShowsInMenuBar) as? Bool ?? true
-        focusLinkOnShortcutName = defaults.string(forKey: Keys.focusLinkOnShortcutName)
-            ?? FocusModeBridge.defaultOnShortcutName
-        focusLinkOffShortcutName = defaults.string(forKey: Keys.focusLinkOffShortcutName)
-            ?? FocusModeBridge.defaultOffShortcutName
+        // 缺键读成空串：空 = 跟随默认（resolved* 的取值口径），
+        // 输入框用占位符把默认名亮出来。读成默认名会让「跟随默认」
+        // 和「用户真的指认了默认名」在存档里无法区分。
+        focusLinkOnShortcutName = defaults.string(forKey: Keys.focusLinkOnShortcutName) ?? ""
+        focusLinkOffShortcutName = defaults.string(forKey: Keys.focusLinkOffShortcutName) ?? ""
         pomodoroLinksFocusMode = defaults.object(forKey: Keys.pomodoroLinksFocusMode) as? Bool ?? false
         isLoading = false
     }
@@ -209,5 +210,19 @@ final class ReminderSettings: ObservableObject {
     private func resolvedShortcutName(_ name: String, fallback: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    /// 名字指认的落盘规则：输入了内容才存（去首尾空白），清空 = 删键
+    /// 回退默认。默认值绝不伪装成用户指认写进存档 —— 曾有用户发现
+    /// 自己指认的名字「自己变回了默认」，存档里躺着的正是默认名。
+    private func storeShortcutName(_ value: String, key: String) {
+        guard !isLoading else { return }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(trimmed, forKey: key)
+        }
+        onChange?(.other)
     }
 }
