@@ -589,9 +589,11 @@ final class FocusModeLinkageTests: XCTestCase {
         }
     }
 
+    /// 模板逐字节对齐系统 UI 写出的格式（Shortcuts.sqlite 实证）：
+    /// 开 = Enabled:1 + FocusModes；关 = 仅 FocusModes；无 Operation/UUID。
     @MainActor
     func testGeneratedWorkflowCarriesVerifiedActionFormat() throws {
-        let target = FocusModeBridge.FocusTarget(identifier: "com.apple.focus.learn", displayName: "learn")
+        let target = FocusModeBridge.FocusTarget(identifier: "com.apple.donotdisturb.mode.graduationcapfill", displayName: "learn")
         let workflow = FocusModeBridge.makeWorkflow(enable: true, target: target)
 
         let actions = try XCTUnwrap(workflow["WFWorkflowActions"] as? [[String: Any]])
@@ -602,19 +604,24 @@ final class FocusModeLinkageTests: XCTestCase {
             "「设置专注模式」的动作标识符，已在本机 WorkflowKit 注册表上查证"
         )
         let parameters = try XCTUnwrap(actions[0]["WFWorkflowActionParameters"] as? [String: Any])
-        XCTAssertEqual(try XCTUnwrap(parameters["Operation"] as? String), "Turn On")
-        XCTAssertEqual(try XCTUnwrap(parameters["Enabled"] as? Bool), true)
+        XCTAssertEqual(
+            Set(parameters.keys),
+            ["Enabled", "FocusModes"],
+            "开启动作的参数键集合必须与系统模板精确一致"
+        )
+        XCTAssertEqual(try XCTUnwrap(parameters["Enabled"] as? Int), 1, "Enabled 是数字 1，与系统存储一致")
         let focus = try XCTUnwrap(parameters["FocusModes"] as? [String: Any])
-        XCTAssertEqual(try XCTUnwrap(focus["Identifier"] as? String), "com.apple.focus.learn")
+        XCTAssertEqual(try XCTUnwrap(focus["Identifier"] as? String), "com.apple.donotdisturb.mode.graduationcapfill")
         XCTAssertEqual(try XCTUnwrap(focus["DisplayString"] as? String), "learn")
 
-        // 关闭文件用同一动作、相反参数。
+        // 关闭动作：只有 FocusModes，无任何开关位。
         let off = FocusModeBridge.makeWorkflow(enable: false, target: target)
         let offParameters = try XCTUnwrap(
             ((off["WFWorkflowActions"] as? [[String: Any]])?[0]["WFWorkflowActionParameters"] as? [String: Any])
         )
-        XCTAssertEqual(try XCTUnwrap(offParameters["Operation"] as? String), "Turn Off")
-        XCTAssertEqual(try XCTUnwrap(offParameters["Enabled"] as? Bool), false)
+        XCTAssertEqual(Set(offParameters.keys), ["FocusModes"])
+        let offFocus = try XCTUnwrap(offParameters["FocusModes"] as? [String: Any])
+        XCTAssertEqual(try XCTUnwrap(offFocus["DisplayString"] as? String), "learn")
     }
 
     @MainActor
@@ -627,12 +634,16 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertEqual(files[0].lastPathComponent, "Restly 专注开启.shortcut")
         XCTAssertEqual(files[1].lastPathComponent, "Restly 专注关闭.shortcut")
 
-        for (file, operation) in zip(files, ["Turn On", "Turn Off"]) {
+        // 开启落盘带 Enabled:1，关闭落盘只有 FocusModes。
+        for (file, expectedKeys) in zip(files, [
+            Set(["Enabled", "FocusModes"]),
+            Set(["FocusModes"]),
+        ]) {
             let data = try Data(contentsOf: file)
             let plist = try PropertyListSerialization.propertyList(from: data, format: nil)
             let actions = try XCTUnwrap(plist as? [String: Any])["WFWorkflowActions"] as? [[String: Any]]
             let parameters = try XCTUnwrap(actions?[0]["WFWorkflowActionParameters"] as? [String: Any])
-            XCTAssertEqual(try XCTUnwrap(parameters["Operation"] as? String), operation)
+            XCTAssertEqual(Set(parameters.keys), expectedKeys)
         }
     }
 
@@ -649,13 +660,14 @@ final class FocusModeLinkageTests: XCTestCase {
 
     // MARK: - 专注模式目标解析
 
-    /// 名字表没命中时优先挑用户自建模式：名字是用户起的，运行时
-    /// 按显示名匹配不会踩本地化坑（系统内置的英文名会踩）。
+    /// 名字表没命中时优先挑非核心模式：graduationcapfill 这类基于系统
+    /// 预设的自定义模式（identifier 看着像内置）名字是用户起的、稳定
+    /// 可用 —— 第四轮误把它当系统模式跳过、错落到勿扰兜底，就是教训。
     func testFocusTargetParsingPrefersFocusLikeNamesThenCustomModes() throws {
         let fixture = """
         {"data": [{"modeConfigurations": {
             "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}},
-            "com.apple.focus.learn": {"mode": {"name": "learn", "modeIdentifier": "com.apple.focus.learn"}}
+            "com.apple.donotdisturb.mode.graduationcapfill": {"mode": {"name": "learn", "modeIdentifier": "com.apple.donotdisturb.mode.graduationcapfill"}}
         }}]}
         """
         let url = FileManager.default.temporaryDirectory
@@ -664,8 +676,29 @@ final class FocusModeLinkageTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
 
         let target = try XCTUnwrap(FocusModeBridge.readFocusTarget(at: url))
-        XCTAssertEqual(target.identifier, "com.apple.focus.learn", "用户自建模式优先于系统内置兜底")
+        XCTAssertEqual(target.identifier, "com.apple.donotdisturb.mode.graduationcapfill", "非核心模式优先于核心兜底")
         XCTAssertEqual(target.displayName, "learn")
+    }
+
+    /// 核心模式（勿扰/睡眠）之间不能互相当兜底：只剩它们时才落勿扰。
+    func testCoreModesDoNotShadowEachOtherInSelection() throws {
+        let fixture = """
+        {"data": [{"modeConfigurations": {
+            "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}},
+            "com.apple.sleep.sleep-mode": {"mode": {"name": "Sleep", "modeIdentifier": "com.apple.sleep.sleep-mode"}}
+        }}]}
+        """
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-\(UUID().uuidString).json")
+        try fixture.data(using: .utf8)!.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let target = try XCTUnwrap(FocusModeBridge.readFocusTarget(
+            at: url,
+            preferredLanguages: ["zh-Hans-CN"]
+        ))
+        XCTAssertEqual(target.identifier, "com.apple.donotdisturb.mode.default")
+        XCTAssertEqual(target.displayName, "勿扰模式")
     }
 
     /// 只剩系统勿扰可兜底时，DisplayString 用本地化显示名 ——

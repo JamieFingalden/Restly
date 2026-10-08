@@ -343,23 +343,28 @@ final class FocusModeBridge: ObservableObject {
     }
 
     /// 单个「设置专注模式」动作的工作流文件。
-    /// Operation 是新版主参数（Turn On / Turn Off / Toggle），Enabled 是
-    /// 旧版的开关位 —— 两处都写上且保持一致，老版本客户端与新版本都认。
-    /// FocusModes 用 {Identifier, DisplayString}：系统按 reverse-DNS 的
-    /// modeIdentifier 引用模式，名字仅作展示。导入后用户可在快捷指令
-    /// App 里自由改成别的专注模式。
+    ///
+    /// 参数逐字节对齐系统 UI 写出的格式（从 Shortcuts.sqlite 的
+    /// ZSHORTCUTACTIONS.ZDATA 提取、实测 run 双双 exit 0）：
+    /// - 开 = Enabled: 1 + FocusModes；关 = 仅 FocusModes（UI 写「关闭」
+    ///   时不带任何开关位，写了多余键反而未经验证）；
+    /// - 不写 Operation / UUID —— 我们猜的 Turn On/Turn Off 从未在真机
+    ///   上验证过，系统模板里也没有；
+    /// - FocusModes 的 DisplayString 是运行时的解析键，必须等于模式在
+    ///   用户系统里的实际显示名（Identifier 只是陪衬）。
     static func makeWorkflow(enable: Bool, target: FocusTarget) -> [String: Any] {
+        var parameters: [String: Any] = [
+            "FocusModes": [
+                "Identifier": target.identifier,
+                "DisplayString": target.displayName,
+            ],
+        ]
+        if enable {
+            parameters["Enabled"] = 1
+        }
         let action: [String: Any] = [
             "WFWorkflowActionIdentifier": "is.workflow.actions.dnd.set",
-            "WFWorkflowActionParameters": [
-                "UUID": "D4E7A1F0-6C3B-4E8A-9F2D-\(enable ? "000000000001" : "000000000002")",
-                "Operation": enable ? "Turn On" : "Turn Off",
-                "Enabled": enable,
-                "FocusModes": [
-                    "Identifier": target.identifier,
-                    "DisplayString": target.displayName,
-                ],
-            ],
+            "WFWorkflowActionParameters": parameters,
         ]
 
         return [
@@ -414,27 +419,23 @@ final class FocusModeBridge: ObservableObject {
         )
     }
 
-    /// 系统内置模式的 modeIdentifier。它们的 name 是英文规范名，
-    /// 运行时按本地化显示名匹配会对不上；用户自建模式的名字是自己
-    /// 起的，没有这个问题 —— 挑目标时优先绕开系统内置。
-    nonisolated static let systemModeIdentifiers: Set<String> = [
+    /// 两大「核心」模式的 identifier：名字是系统起的、随本地化变化，
+    /// 运行时按显示名解析必然踩本地化坑，只能靠 localizedDoNotDisturbName
+    /// 硬映射。其余模式（哪怕基于系统预设改的，如 graduationcapfill 的
+    /// "learn"）名字都是用户自己起的、稳定可用 —— 判定标准是「这个名字
+    /// 是否稳定」，不是 identifier 是否内置。
+    nonisolated static let coreModeIdentifiers: Set<String> = [
         "com.apple.donotdisturb.mode.default",
         "com.apple.sleep.sleep-mode",
-        "com.apple.donotdisturb.mode.driving",
-        "com.apple.donotdisturb.mode.personal",
-        "com.apple.donotdisturb.mode.work",
-        "com.apple.donotdisturb.mode.mindfulness",
-        "com.apple.donotdisturb.mode.fitness",
-        "com.apple.donotdisturb.mode.gaming",
-        "com.apple.donotdisturb.mode.reading",
     ]
 
     /// 挑选规则（层层兜底）：
     /// 1. 名字带「专注 / Focus / Work / 工作」—— 用户的意图明写在那里；
-    /// 2. 任何用户自建模式 —— 名字天然本地化无歧义（实测 "learn" 可用）；
-    /// 3. 系统勿扰模式兜底 —— 但 DisplayString 必须写本地化显示名
-    ///   （实测写规范名 "Do Not Disturb" 在中文系统上运行时报
-    ///   「不存在名为…的专注模式」），映射不到就原样写并靠教程提示。
+    /// 2. 任何非核心模式 —— DisplayString 即解析键且稳定（实测 "learn"
+    ///   可用）；多个时取第一个；
+    /// 3. 核心勿扰兜底 —— DisplayString 写本地化显示名（实测写规范名
+    ///   "Do Not Disturb" 在中文系统上运行时报「不存在名为…的专注
+    ///   模式」），映射不到就原样写并靠教程提示兜底。
     nonisolated static func readFocusTarget(
         at url: URL,
         preferredLanguages: [String] = Locale.preferredLanguages
@@ -462,8 +463,8 @@ final class FocusModeBridge: ObservableObject {
         if let preferred = modes.first(where: { preferredNames.contains($0.displayName) }) {
             return preferred
         }
-        if let custom = modes.first(where: { !systemModeIdentifiers.contains($0.identifier) }) {
-            return custom
+        if let stable = modes.first(where: { !coreModeIdentifiers.contains($0.identifier) }) {
+            return stable
         }
         guard let dnd = modes.first(where: { $0.identifier == "com.apple.donotdisturb.mode.default" }) else {
             return nil
