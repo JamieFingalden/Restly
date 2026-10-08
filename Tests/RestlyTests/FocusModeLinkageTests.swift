@@ -731,6 +731,64 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertEqual(unmapped.displayName, "Do Not Disturb", "映射不到退回规范名，靠教程提示兜底")
     }
 
+    /// 配置文件读不到/解析失败/为空都不得让一键创建死掉：
+    /// 静态勿扰兜底（identifier 全系统恒定）+ 黑匣子记下原因。
+    /// 实测同一构建终端启动读得到、open 启动被拒（打包身份漂移），
+    /// 这条兜底是最后一颗钉子。
+    func testReadFocusTargetFallsBackToStaticDNDWhenConfigurationUnavailable() throws {
+        let originalLog = DebugEventLog.shared
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyLogTest-\(UUID().uuidString).log")
+        DebugEventLog.shared = DebugEventLog(url: logURL)
+        defer {
+            DebugEventLog.shared = originalLog
+            try? FileManager.default.removeItem(at: logURL)
+        }
+
+        let expected = FocusModeBridge.FocusTarget(
+            identifier: "com.apple.donotdisturb.mode.default",
+            displayName: "勿扰模式"
+        )
+        let expectedEnglish = FocusModeBridge.FocusTarget(
+            identifier: "com.apple.donotdisturb.mode.default",
+            displayName: "Do Not Disturb"
+        )
+
+        // 文件不存在。
+        let missingURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-missing-\(UUID().uuidString).json")
+        XCTAssertEqual(
+            FocusModeBridge.readFocusTarget(at: missingURL, preferredLanguages: ["zh-Hans-CN"]),
+            expected
+        )
+
+        // 解析失败。
+        let garbageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-garbage-\(UUID().uuidString).json")
+        try "not json".data(using: .utf8)!.write(to: garbageURL)
+        defer { try? FileManager.default.removeItem(at: garbageURL) }
+        XCTAssertEqual(
+            FocusModeBridge.readFocusTarget(at: garbageURL, preferredLanguages: ["en-US"]),
+            expectedEnglish
+        )
+
+        // 模式列表为空。
+        let emptyURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-empty-\(UUID().uuidString).json")
+        try "{\"data\": [{}]}".data(using: .utf8)!.write(to: emptyURL)
+        defer { try? FileManager.default.removeItem(at: emptyURL) }
+        XCTAssertEqual(
+            FocusModeBridge.readFocusTarget(at: emptyURL, preferredLanguages: ["zh-Hans-CN"]),
+            expected
+        )
+
+        // 黑匣子要能分清三种原因，别让「为什么 nil」再成悬案。
+        let content = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(content.contains("配置文件不存在"), content)
+        XCTAssertTrue(content.contains("解析失败"), content)
+        XCTAssertTrue(content.contains("没有任何模式"), content)
+    }
+
     func testLocalizedDoNotDisturbCoversMajorLanguages() {
         XCTAssertEqual(FocusModeBridge.localizedDoNotDisturbName(preferredLanguages: ["zh-Hans-CN"]), "勿扰模式")
         XCTAssertEqual(FocusModeBridge.localizedDoNotDisturbName(preferredLanguages: ["zh-Hant-TW"]), "勿擾模式")
@@ -759,6 +817,9 @@ final class FocusModeLinkageTests: XCTestCase {
             .appendingPathComponent("RestlyFocusTest-\(UUID().uuidString).json")
         try "not json".data(using: .utf8)!.write(to: garbage)
         defer { try? FileManager.default.removeItem(at: garbage) }
-        XCTAssertNil(FocusModeBridge.readFocusTarget(at: garbage))
+        // 解析失败不再返回 nil（那会让一键创建死在最后一步），
+        // 而是落静态勿扰兜底，原因进黑匣子 —— 见专项测试。
+        let fallback = try XCTUnwrap(FocusModeBridge.readFocusTarget(at: garbage))
+        XCTAssertEqual(fallback.identifier, "com.apple.donotdisturb.mode.default")
     }
 }

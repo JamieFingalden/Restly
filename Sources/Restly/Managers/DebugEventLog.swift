@@ -9,7 +9,10 @@ import Foundation
 /// 写一行分隔 —— 日志是跨启动追加的，靠它分段。
 ///
 /// 写失败只 NSLog 留痕：日志是诊断工具，绝不能反过来把功能搞挂。
-@MainActor
+///
+/// 线程模型：log 可从任意上下文调用（bridge 的解析兜底跑在非隔离
+/// 静态函数里，也要能落一行），写入用锁串行化，行内时间戳由
+/// Foundation 的线程安全 FormatStyle 生成。
 final class DebugEventLog {
     /// 默认落在用户的 Logs 目录（Console.app 能直接看到）。
     nonisolated static var defaultURL: URL {
@@ -21,24 +24,28 @@ final class DebugEventLog {
             .appendingPathComponent("Restly.log")
     }
 
-    static let shared = DebugEventLog(url: defaultURL)
+    /// 可替换（测试把 shared 指到临时文件验证落盘内容）。
+    nonisolated(unsafe) static var shared = DebugEventLog(url: defaultURL)
+
+    private static let writeLock = NSLock()
 
     private let url: URL
-    private let dateProvider: () -> Date
+    private let dateProvider: @Sendable () -> Date
 
-    private static let timestampFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter
-    }()
-
-    init(url: URL, dateProvider: @escaping () -> Date = Date.init) {
+    init(url: URL, dateProvider: @escaping @Sendable () -> Date = Date.init) {
         self.url = url
         self.dateProvider = dateProvider
     }
 
-    func log(_ message: String) {
-        let line = "[\(Self.timestampFormatter.string(from: dateProvider()))] \(message)\n"
+    /// 任意上下文可调 —— 配置解析的兜底日志在非隔离静态函数里。
+    nonisolated func log(_ message: String) {
+        Self.appendLine(message, date: dateProvider(), to: url)
+    }
+
+    private nonisolated static func appendLine(_ message: String, date: Date, to url: URL) {
+        let line = "[\(date.formatted(date: .omitted, time: .standard))] \(message)\n"
+        writeLock.lock()
+        defer { writeLock.unlock() }
         do {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),

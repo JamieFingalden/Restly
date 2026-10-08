@@ -364,7 +364,8 @@ final class FocusModeBridge: ObservableObject {
         return false
     }
 
-    /// 生成开启/关闭两个 plist。FocusTarget 读不到就抛错，
+    /// 生成开启/关闭两个 plist。FocusTarget 读不到就抛错（理论不再
+    /// 发生：readFocusTarget 有静态勿扰兜底，这层 guard 纯防御），
     /// 由调用方决定降级（一键创建失败 ≠ 功能不可用，还有手动教程）。
     func generateShortcutFiles() throws -> [URL] {
         guard let target = focusTargetProvider() else {
@@ -489,10 +490,30 @@ final class FocusModeBridge: ObservableObject {
         at url: URL,
         preferredLanguages: [String] = Locale.preferredLanguages
     ) -> FocusTarget? {
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        // 最终兜底：勿扰模式的 identifier 全系统恒定，不依赖这份文件 ——
+        // 文件读取可能因打包身份被系统拒绝（实测：同一构建，终端启动的
+        // 进程读得到，open/Finder 启动的被拒，授权随签名身份漂移）。
+        // 一键创建永远不能死在「读不到配置」这一步。
+        let fallback = FocusTarget(
+            identifier: "com.apple.donotdisturb.mode.default",
+            displayName: localizedDoNotDisturbName(preferredLanguages: preferredLanguages) ?? "勿扰模式"
+        )
+
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            DebugEventLog.shared.log("联动安装：专注模式配置文件不存在（\(url.path)），用勿扰兜底")
+            return fallback
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            DebugEventLog.shared.log("联动安装：专注模式配置读取失败 —— \(error.localizedDescription)，用勿扰兜底")
+            return fallback
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let entries = object["data"] as? [[String: Any]] else {
-            return nil
+            DebugEventLog.shared.log("联动安装：专注模式配置解析失败，用勿扰兜底")
+            return fallback
         }
 
         var modes: [FocusTarget] = []
@@ -506,7 +527,10 @@ final class FocusModeBridge: ObservableObject {
                 modes.append(FocusTarget(identifier: identifier, displayName: name))
             }
         }
-        guard !modes.isEmpty else { return nil }
+        guard !modes.isEmpty else {
+            DebugEventLog.shared.log("联动安装：专注模式配置里没有任何模式，用勿扰兜底")
+            return fallback
+        }
 
         let preferredNames = ["专注", "Focus", "Work", "工作"]
         if let preferred = modes.first(where: { preferredNames.contains($0.displayName) }) {
@@ -516,7 +540,9 @@ final class FocusModeBridge: ObservableObject {
             return stable
         }
         guard let dnd = modes.first(where: { $0.identifier == "com.apple.donotdisturb.mode.default" }) else {
-            return nil
+            // 名单里连勿扰都没有：静态勿扰兜底照给（identifier 恒定）。
+            DebugEventLog.shared.log("联动安装：配置里没有勿扰模式，用静态勿扰兜底")
+            return fallback
         }
         let displayName = localizedDoNotDisturbName(preferredLanguages: preferredLanguages)
             ?? dnd.displayName

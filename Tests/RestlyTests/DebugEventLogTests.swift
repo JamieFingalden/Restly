@@ -14,16 +14,21 @@ final class DebugEventLogTests: XCTestCase {
         return String(decoding: data, as: UTF8.self)
     }
 
-    @MainActor
+    /// dateProvider 现是 @Sendable，可变状态装进盒子里再被捕获。
+    private final class MutableDateBox: @unchecked Sendable {
+        var value: Date
+        init(_ value: Date) { self.value = value }
+    }
+
     func testAppendsTimestampedLinesAcrossWrites() {
         let url = makeTemporaryLogURL()
         defer { try? FileManager.default.removeItem(at: url) }
 
-        var fixedDate = Date(timeIntervalSinceReferenceDate: 700_000_000)
-        let log = DebugEventLog(url: url, dateProvider: { fixedDate })
+        let dateBox = MutableDateBox(Date(timeIntervalSinceReferenceDate: 700_000_000))
+        let log = DebugEventLog(url: url, dateProvider: { dateBox.value })
 
         log.log("第一条")
-        fixedDate = fixedDate.addingTimeInterval(65)
+        dateBox.value = dateBox.value.addingTimeInterval(65)
         log.log("第二条")
 
         let lines = readAll(url).split(separator: "\n")
