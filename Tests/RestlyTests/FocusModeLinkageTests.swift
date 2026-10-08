@@ -15,6 +15,8 @@ final class FocusModeLinkageTests: XCTestCase {
         struct Invocation {
             let command: String
             let name: String
+            /// /usr/bin/shortcuts 之后的完整 argv，供 sign 参数断言用。
+            let argv: [String]
         }
 
         private(set) var invocations: [Invocation] = []
@@ -27,10 +29,25 @@ final class FocusModeLinkageTests: XCTestCase {
 
         var runner: FocusModeBridge.ProcessRunner {
             { [self] arguments, completion in
-                // argv[0] 是 /usr/bin/shortcuts，后面才是子命令与名字。
+                // argv[0] 是 /usr/bin/shortcuts，后面才是子命令与参数。
                 let rest = Array(arguments.dropFirst())
-                invocations.append(Invocation(command: rest.first ?? "", name: rest.count > 1 ? rest[1] : ""))
+                invocations.append(Invocation(
+                    command: rest.first ?? "",
+                    name: rest.count > 1 ? rest[1] : "",
+                    argv: rest
+                ))
                 let response = responses.isEmpty ? (Int32(0), "") : responses.removeFirst()
+                // 模拟真 sign 的契约：成功时要在 -o 位置产出文件，
+                // 否则 bridge 的「签名后写回原路径」无从谈起。
+                if rest.first == "sign", response.0 == 0,
+                   let inputIndex = rest.firstIndex(of: "-i"),
+                   let outputIndex = rest.firstIndex(of: "-o"),
+                   rest.count > max(inputIndex, outputIndex) + 1 {
+                    try? FileManager.default.copyItem(
+                        atPath: rest[inputIndex + 1],
+                        toPath: rest[outputIndex + 1]
+                    )
+                }
                 completion(response.0, response.1)
             }
         }
@@ -371,6 +388,69 @@ final class FocusModeLinkageTests: XCTestCase {
             return XCTFail("打不开文件应报 openFailed，实际 \(outcome)")
         }
         XCTAssertTrue(reason.contains("设定专注模式"), "失败文案要点名哪条没打开")
+    }
+
+    // MARK: - 签名环节（macOS 27 拒收未签名文件）
+
+    @MainActor
+    func testInstallSignsEachShortcutWithCorrectArgumentsBeforeOpening() async {
+        var opened: [String] = []
+        let stub = RunnerStub()
+        let bridge = makeBridge(
+            runner: stub.runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式"),
+            openHandler: { opened.append($0.lastPathComponent); return true }
+        )
+
+        let outcome = await bridge.installShortcuts()
+
+        XCTAssertEqual(outcome, .opened)
+        let signs = stub.invocations.filter { $0.command == "sign" }
+        XCTAssertEqual(signs.count, 2, "两个文件各签一次")
+        // argv 形如 ["sign", "-i", <源>, "-o", <签名输出>]，顺序固定。
+        for (sign, fileName) in zip(signs, ["设定专注模式.shortcut", "关闭专注模式.shortcut"]) {
+            XCTAssertEqual(sign.argv.first, "sign")
+            XCTAssertEqual(sign.argv.count, 5)
+            XCTAssertEqual(sign.argv[1], "-i")
+            XCTAssertEqual((sign.argv[2] as NSString).lastPathComponent, fileName)
+            XCTAssertEqual(sign.argv[3], "-o")
+            XCTAssertEqual((sign.argv[4] as NSString).lastPathComponent, "signed-\(fileName)")
+        }
+        // 打开的必须是签名后写回原路径的文件。
+        XCTAssertEqual(opened, ["设定专注模式.shortcut", "关闭专注模式.shortcut"])
+    }
+
+    @MainActor
+    func testInstallMapsSignFailureToGenerationFailedAndNeverOpens() async {
+        let stub = RunnerStub(responses: [
+            (2, "无法验证或签名"),   // 第一条就签失败
+        ])
+        var opened: [String] = []
+        var signSourcePath: String?
+        let bridge = makeBridge(
+            runner: stub.runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式"),
+            openHandler: { opened.append($0.lastPathComponent); return true }
+        )
+        // 借 openHandler 拿不到（不会走到），从 sign 的 argv 记下源路径。
+        // 直接包装 runner 前先记：简单起见在断言阶段从 stub 里取。
+        defer { _ = signSourcePath }
+
+        let outcome = await bridge.installShortcuts()
+
+        guard case .generationFailed(let reason) = outcome else {
+            return XCTFail("签名失败应归入 generationFailed，实际 \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("2"), "reason 要带退出码：\(reason)")
+        XCTAssertTrue(reason.contains("无法验证或签名"), "reason 要带输出：\(reason)")
+        XCTAssertTrue(opened.isEmpty, "签名失败绝不能再交给系统打开")
+        XCTAssertEqual(stub.invocations.filter { $0.command == "sign" }.count, 1, "第一条失败即止，不签第二条")
+
+        // 失败后临时目录要清干净：sign 的源文件应已不存在。
+        signSourcePath = stub.invocations.first { $0.command == "sign" }?.argv[2]
+        if let path = signSourcePath {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: path), "半成品不该留在临时目录")
+        }
     }
 
     // MARK: - FocusModeBridge 本体

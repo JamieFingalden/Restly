@@ -5,8 +5,10 @@ import Foundation
 ///
 /// 联动的载体是两条固定名字的快捷指令（「设置专注模式」动作封装成
 /// 开启/关闭各一条），执行走 `shortcuts` CLI —— 它只有 run / list /
-/// view / sign 四个子命令、没有 import，所以「安装」只能生成
-/// `.shortcut` 文件交给系统打开，由快捷指令 App 弹预览、用户点一次
+/// view / sign 四个子命令、没有 import，所以「安装」= 运行时生成
+/// `.shortcut` plist，先 `shortcuts sign` 签名（macOS 27 的快捷指令
+/// App 拒收未签名文件，实测；sign 走默认 people-who-know-me，离线
+/// 秒回），再交给系统打开、由快捷指令 App 弹预览，用户点一次
 /// 「添加快捷指令」。这是系统唯一开放的路，不碰任何私有 API。
 ///
 /// 设计取舍：
@@ -208,18 +210,58 @@ final class FocusModeBridge: ObservableObject {
         guard files.count == 2 else {
             return .generationFailed("生成结果不完整（\(files.count) 个文件）")
         }
+        // 快捷指令 App 拒收未签名文件（实测）：两个都先 sign，再依次打开。
+        for file in files {
+            if let failure = await signShortcutFile(at: file) {
+                cleanupTemporaryFiles(files)
+                return .generationFailed(failure)
+            }
+        }
         guard openHandler(files[0]) else {
+            cleanupTemporaryFiles(files)
             NSLog("Restly 无法打开快捷指令文件：\(files[0].path)")
             return .openFailed("无法打开「\(currentNames.on).shortcut」")
         }
         if interOpenDelay > 0 {
+            // 两个预览叠在一起会互相抢占前台，中间留一秒。
             try? await Task.sleep(for: .seconds(interOpenDelay))
         }
         guard openHandler(files[1]) else {
+            cleanupTemporaryFiles(files)
             NSLog("Restly 无法打开快捷指令文件：\(files[1].path)")
             return .openFailed("无法打开「\(currentNames.off).shortcut」")
         }
         return .opened
+    }
+
+    /// 就地签名：`shortcuts sign`（默认 people-who-know-me 模式，无网络
+    /// 依赖）签到临时名，再把原路径换成签名产物 —— 调用方拿到的仍是
+    /// 同一组 `.shortcut` 路径。失败带退出码与输出回去，绝不静默。
+    private func signShortcutFile(at url: URL) async -> String? {
+        let workingURL = url.deletingLastPathComponent()
+            .appendingPathComponent("signed-" + url.lastPathComponent)
+        let (status, output) = await run([
+            "sign", "-i", url.path, "-o", workingURL.path,
+        ])
+        guard status == 0 else {
+            try? FileManager.default.removeItem(at: workingURL)
+            return "签名失败（shortcuts 退出码 \(status)）：\(output)"
+        }
+        do {
+            try FileManager.default.removeItem(at: url)
+            try FileManager.default.moveItem(at: workingURL, to: url)
+        } catch {
+            try? FileManager.default.removeItem(at: workingURL)
+            return "签名后替换文件失败：\(error.localizedDescription)"
+        }
+        return nil
+    }
+
+    /// 临时目录清场：无论哪一步失败，都别把半成品留在 tmp 里。
+    private func cleanupTemporaryFiles(_ files: [URL]) {
+        for file in files {
+            try? FileManager.default.removeItem(at: file)
+        }
     }
 
     /// 安装确认：清掉缓存与缺失标记后重新检查。轮询里检测到就绪即停。
