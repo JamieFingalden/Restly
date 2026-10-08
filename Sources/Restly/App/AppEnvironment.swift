@@ -11,6 +11,9 @@ final class AppEnvironment: ObservableObject {
     private var menuPreviewWindowController: MenuPreviewWindowController?
 
     init() {
+        // 黑匣子分隔行：日志跨启动追加，靠它分段，并记下这次跑的是
+        // 哪个构建（「哪个实例」的悬案靠它终结）。
+        DebugEventLog.shared.logLaunchSeparator()
         let arguments = ProcessInfo.processInfo.arguments
         let settings = ReminderSettings()
         let screenStateMonitor = ScreenStateMonitor()

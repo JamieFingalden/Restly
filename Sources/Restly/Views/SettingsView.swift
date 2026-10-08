@@ -15,6 +15,10 @@ struct SettingsView: View {
     @State private var isCheckingLinkage = false
     @State private var showCreationChoice = false
     @State private var installSheet: FocusLinkageInstallSheetState?
+    /// 等待页的「推迟一拍再呈现」任务。必须随取消/新流程一起取消，
+    /// 否则用户关掉等待页 400ms 后它又把 sheet 拉回来 —— 残留状态的
+    /// 活教材，正是本轮要抓的那类回归。
+    @State private var installSheetPresentationTask: Task<Void, Never>?
     @State private var showTutorial = false
     @State private var installTask: Task<Void, Never>?
     /// 「从已有快捷指令中选择」的选项名单，一次 list 缓存着用。
@@ -34,6 +38,7 @@ struct SettingsView: View {
         }
         .frame(width: 600, height: 590)
         .onAppear {
+            DebugEventLog.shared.log("设置页：出现，强制重检联动状态")
             launchAtLoginManager.refresh()
             // 设置窗口每次出现都强制重检：窗口可能开着跨越用户删指令，
             // 旧结论哪怕一分钟前刚查过也会撒谎。设置页不是常驻界面，
@@ -45,11 +50,18 @@ struct SettingsView: View {
             isPresented: $showCreationChoice,
             titleVisibility: .visible
         ) {
-            Button("一键创建") { runAutomaticInstall() }
-            Button("手动创建") { showTutorial = true }
+            Button("一键创建") {
+                DebugEventLog.shared.log("设置页：用户选择一键创建")
+                runAutomaticInstall()
+            }
+            Button("手动创建") {
+                DebugEventLog.shared.log("设置页：用户选择手动创建")
+                showTutorial = true
+            }
             Button("取消并关闭联动", role: .destructive) {
                 // 取消是唯一把开关拨回去的路径：联动开着而指令不存在，
                 // 只会让每个专注流转都白跑进程。
+                DebugEventLog.shared.log("设置页：用户取消创建引导，联动关闭")
                 settings.pomodoroLinksFocusMode = false
             }
         } message: {
@@ -70,6 +82,8 @@ struct SettingsView: View {
             } onCancel: {
                 installTask?.cancel()
                 installTask = nil
+                installSheetPresentationTask?.cancel()
+                installSheetPresentationTask = nil
                 installSheet = nil
             } onRetry: {
                 installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
@@ -102,6 +116,7 @@ struct SettingsView: View {
         Binding(
             get: { settings.pomodoroLinksFocusMode },
             set: { turnOn in
+                DebugEventLog.shared.log("设置页：联动开关翻转 → \(turnOn ? "ON" : "OFF")")
                 settings.pomodoroLinksFocusMode = turnOn
                 guard turnOn else { return }
                 // PomodoroManager 的联动同步已随置位生效；这里只负责
@@ -292,10 +307,19 @@ struct SettingsView: View {
     /// 一键创建：生成文件并交给快捷指令 App，随后有界轮询等用户
     /// 点完「添加快捷指令」。生成/打开失败带原因进 sheet，绝不静默。
     private func runAutomaticInstall() {
+        DebugEventLog.shared.log("一键创建：流程启动")
         installTask?.cancel()
-        installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
+        installSheetPresentationTask?.cancel()
+        // 对话框还在退场动画时就设置 sheet 的呈现状态，macOS 会静默
+        // 丢弃（「点了没反应」的另一嫌疑）；推迟一拍再上等待页。
+        installSheetPresentationTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
+        }
         installTask = Task {
             let outcome = await focusModeBridge.installShortcuts()
+            DebugEventLog.shared.log("一键创建：installShortcuts 返回 \(outcome)")
             if Task.isCancelled { return }
             switch outcome {
             case .opened:
@@ -316,10 +340,13 @@ struct SettingsView: View {
                 if Task.isCancelled { return }
                 elapsed += Int(Self.installPollInterval)
                 if await focusModeBridge.confirmInstalled() {
+                    DebugEventLog.shared.log("一键创建：轮询 \(elapsed) 秒时确认已就绪")
                     installSheet = nil
                     return
                 }
+                DebugEventLog.shared.log("一键创建：轮询 \(elapsed)/\(Self.installTotalSeconds) 秒，尚未就绪")
             }
+            DebugEventLog.shared.log("一键创建：轮询超时，降级为未检测到")
             installSheet = .timedOut
         }
     }

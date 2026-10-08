@@ -126,7 +126,7 @@ final class FocusModeBridge: ObservableObject {
         existenceCacheTTL: TimeInterval = 60,
         openHandler: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
         interOpenDelay: TimeInterval = 1.0,
-        ensureAppRunning: @escaping AppRunningEnsurer = FocusModeBridge.wakeShortcutsAppInBackground
+        ensureAppRunning: AppRunningEnsurer? = nil
     ) {
         self.runner = runner ?? Self.defaultRunner(workQueue: workQueue)
         self.namesProvider = namesProvider
@@ -134,19 +134,26 @@ final class FocusModeBridge: ObservableObject {
         self.existenceCacheTTL = existenceCacheTTL
         self.openHandler = openHandler
         self.interOpenDelay = interOpenDelay
-        self.ensureAppRunning = ensureAppRunning
+        self.ensureAppRunning = ensureAppRunning ?? Self.wakeShortcutsAppInBackground
     }
 
     /// 后台拉起快捷指令 App（不抢焦点），再留一秒余量等它的 XPC
     /// 服务可用 —— sign 依赖 App 在跑，否则报误导性的「格式不正确」。
-    nonisolated static func wakeShortcutsAppInBackground() async {
+    ///
+    /// 刻意用回调版 openApplication 而不是 `try await`：回调在个别
+    /// 状态下可能永不到来，第六轮「点了没反应、零文件零日志」的
+    /// 现场里这是头号嫌疑 —— 安装链绝不能陪一个系统回调挂死，
+    /// 拉不起来的后果由首签失败的重试兜住，最坏也只是报错。
+    @MainActor
+    static func wakeShortcutsAppInBackground() async {
+        DebugEventLog.shared.log("联动安装：后台拉起快捷指令 App")
         let url = URL(fileURLWithPath: "/System/Applications/Shortcuts.app")
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
-        do {
-            try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-        } catch {
-            NSLog("Restly 唤起快捷指令 App 失败：\(error.localizedDescription)")
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+            if let error {
+                NSLog("Restly 唤起快捷指令 App 失败：\(error.localizedDescription)")
+            }
         }
         try? await Task.sleep(for: .seconds(1))
     }
@@ -233,16 +240,21 @@ final class FocusModeBridge: ObservableObject {
     /// 用户点不点「添加快捷指令」只有系统知道，这里不猜。
     func installShortcuts() async -> InstallOutcome {
         let currentNames = names
+        DebugEventLog.shared.log("联动安装：进入（目标「\(currentNames.on)」「\(currentNames.off)」）")
+        sweepStaleTemporaryDirectories()
         let files: [URL]
         do {
             files = try generateShortcutFiles()
         } catch {
+            DebugEventLog.shared.log("联动安装：生成失败 —— \(error.localizedDescription)")
             NSLog("Restly 生成专注模式快捷指令文件失败：\(error.localizedDescription)")
             return .generationFailed(error.localizedDescription)
         }
         guard files.count == 2 else {
+            DebugEventLog.shared.log("联动安装：生成结果不完整（\(files.count) 个文件）")
             return .generationFailed("生成结果不完整（\(files.count) 个文件）")
         }
+        DebugEventLog.shared.log("联动安装：已生成待签文件 \(files.map(\.lastPathComponent).joined(separator: "、"))")
         // 快捷指令 App 拒收未签名文件，而 sign 又依赖 App 在跑
         //（实测：App 退出时签名必失败，报错误导人的「格式不正确」）
         // —— 签名前先把它拉起来；首签失败再补一次拉起 + 重试。
@@ -250,14 +262,19 @@ final class FocusModeBridge: ObservableObject {
         for file in files {
             if await signShortcutFile(at: file) != nil {
                 // 首签失败常见于 App 还没就绪：补一次拉起再试，仍败才报。
+                DebugEventLog.shared.log("联动安装：「\(file.lastPathComponent)」首签失败，补拉 App 后重试")
                 await ensureAppRunning()
                 if let retryFailure = await signShortcutFile(at: file) {
+                    DebugEventLog.shared.log("联动安装：重签仍失败 —— \(retryFailure)")
                     cleanupTemporaryFiles(files)
                     return .generationFailed(retryFailure)
                 }
             }
+            DebugEventLog.shared.log("联动安装：「\(file.lastPathComponent)」已签名")
         }
+        DebugEventLog.shared.log("联动安装：打开「\(currentNames.on).shortcut」")
         guard openHandler(files[0]) else {
+            DebugEventLog.shared.log("联动安装：打开「\(currentNames.on).shortcut」失败")
             cleanupTemporaryFiles(files)
             NSLog("Restly 无法打开快捷指令文件：\(files[0].path)")
             return .openFailed("无法打开「\(currentNames.on).shortcut」")
@@ -266,17 +283,25 @@ final class FocusModeBridge: ObservableObject {
             // 两个预览叠在一起会互相抢占前台，中间留一秒。
             try? await Task.sleep(for: .seconds(interOpenDelay))
         }
+        DebugEventLog.shared.log("联动安装：打开「\(currentNames.off).shortcut」")
         guard openHandler(files[1]) else {
+            DebugEventLog.shared.log("联动安装：打开「\(currentNames.off).shortcut」失败")
             cleanupTemporaryFiles(files)
             NSLog("Restly 无法打开快捷指令文件：\(files[1].path)")
             return .openFailed("无法打开「\(currentNames.off).shortcut」")
         }
+        DebugEventLog.shared.log("联动安装：两个文件都已交给系统，等待用户确认导入")
         return .opened
     }
 
     /// 就地签名：`shortcuts sign`（默认 people-who-know-me 模式，无网络
     /// 依赖）签到临时名，再把原路径换成签名产物 —— 调用方拿到的仍是
     /// 同一组 `.shortcut` 路径。失败带退出码与输出回去，绝不静默。
+    ///
+    /// ⚠️ sign 的输入文件必须带 `.shortcut` 扩展名：实测同内容文件改成
+    /// `.unsigned` 就会报「The file couldn't be opened because it isn't in
+    /// the correct format」（与「快捷指令 App 没在跑」同款误导性报错）。
+    /// 本实现源路径与输出路径都刻意保留扩展名，动这两个路径时别丢了。
     private func signShortcutFile(at url: URL) async -> String? {
         let workingURL = url.deletingLastPathComponent()
             .appendingPathComponent("signed-" + url.lastPathComponent)
@@ -298,9 +323,33 @@ final class FocusModeBridge: ObservableObject {
     }
 
     /// 临时目录清场：无论哪一步失败，都别把半成品留在 tmp 里。
+    /// 只删文件会留下空壳目录（实测清过一轮目录还在），目录一并删。
     private func cleanupTemporaryFiles(_ files: [URL]) {
+        var directories: Set<URL> = []
         for file in files {
+            directories.insert(file.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: file)
+        }
+        for directory in directories {
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    /// 清扫更早夭折的安装残留。崩溃、强退或链路挂死都会留下
+    /// RestlyFocusShortcuts-* 目录，任何清理逻辑都救不了「没跑到」
+    /// 的那次 —— 每次安装开始时把一天前的残留扫掉。
+    private func sweepStaleTemporaryDirectories() {
+        let temporary = FileManager.default.temporaryDirectory
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: temporary,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return }
+        for item in contents where item.lastPathComponent.hasPrefix("RestlyFocusShortcuts-") {
+            let modified = try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            if let modified, Date().timeIntervalSince(modified) > 86_400 {
+                DebugEventLog.shared.log("联动安装：清扫陈旧临时目录 \(item.lastPathComponent)")
+                try? FileManager.default.removeItem(at: item)
+            }
         }
     }
 
@@ -513,6 +562,7 @@ final class FocusModeBridge: ObservableObject {
         lastKnownExistence = .missing
         lastExistenceCheckDate = Date()
         let currentNames = names
+        DebugEventLog.shared.log("联动熔断：未检测到「\(currentNames.on)」「\(currentNames.off)」，停止重试")
         NSLog("Restly 未检测到快捷指令「\(currentNames.on)」「\(currentNames.off)」，联动停止重试，直到重新创建。")
     }
 
