@@ -19,7 +19,7 @@ plutil -lint "${INFO_PATH}"
 # 打包时 build.sh 会把包内 CFBundleVersion 改写为唯一构建号（git短哈希-时间戳），
 # 这是有意为之的差异：断言戳记形态正确，其余所有键转成 XML 后仍要求完全一致。
 STAMPED_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${INFO_PATH}")"
-[[ "${STAMPED_BUILD}" =~ ^[0-9]{1,6}\.[0-9]{8}$ ]] || {
+[[ "${STAMPED_BUILD}" =~ ^[0-9]{1,4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]] || {
     echo "包内 CFBundleVersion 不是合法的数字构建号（提交数.月日时分）：${STAMPED_BUILD}" >&2
     exit 1
 }

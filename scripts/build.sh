@@ -43,7 +43,9 @@ install -m 644 "${PROJECT_DIR}/Support/Info.plist" "${CONTENTS_DIR}/Info.plist"
 # git 短哈希放进独立诊断键 RestlyBuildStamp（黑匣子日志用于对齐 commit）。
 COMMIT_COUNT="$(git -C "${PROJECT_DIR}" rev-list --count HEAD)"
 BUILD_STAMP="$(git -C "${PROJECT_DIR}" rev-parse --short HEAD)-$(date +%m%d%H%M)"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${COMMIT_COUNT}.$(date +%m%d%H%M)" "${CONTENTS_DIR}/Info.plist"
+# CFBundleVersion 各段有位宽限制（主版本≤4位，次/补丁≤2位）：
+# 用「提交数.月.日」——提交数主导单调性，同日重打包的差异由 RestlyBuildStamp 区分。
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${COMMIT_COUNT}.$(date +%-m).$(date +%-d)" "${CONTENTS_DIR}/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :RestlyBuildStamp string ${BUILD_STAMP}" "${CONTENTS_DIR}/Info.plist"
 install -m 644 "${ICON_SOURCE_PATH}" "${CONTENTS_DIR}/Resources/RestlyIcon.png"
 install -m 644 "${PROJECT_DIR}/LICENSE" "${CONTENTS_DIR}/Resources/LICENSE"
