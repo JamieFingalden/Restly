@@ -384,10 +384,12 @@ final class PomodoroManager: ObservableObject {
     func handleAppWillTerminate() {
         guard isFocusLinkEngaged else { return }
         isFocusLinkEngaged = false
-        let bridge = focusModeBridge
-        Task { @MainActor in
-            _ = await bridge.setFocusEngaged(false)
-        }
+        // 退出路径必须同步把子进程拉起来：Task 排队的话，主 actor
+        // 回调一返回进程就可能退出，Task 根本没轮到执行，专注模式
+        // 被留在开着的状态。Process.run() 只负责拉起（不等待退出），
+        // 子进程独立于父进程存活；失败留痕即可 —— 下次启动恢复
+        // running focus 后会重新联动，不会卡死在错误状态。
+        focusModeBridge.launchOffShortcutSynchronously()
     }
 
     /// 让菜单栏倒计时状态与 session 对齐：计时中挂秒级 Timer，

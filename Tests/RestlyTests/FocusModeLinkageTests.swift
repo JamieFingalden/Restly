@@ -59,6 +59,19 @@ final class FocusModeLinkageTests: XCTestCase {
         func record() { count += 1 }
     }
 
+    /// 记录退出路径同步启动器的完整 argv（可注入抛错验证失败路径）。
+    private final class SyncLaunchRecorder: @unchecked Sendable {
+        private(set) var argvList: [[String]] = []
+        let error: Error?
+        init(shouldFail: Bool = false) {
+            error = shouldFail ? NSError(domain: "test", code: 1) : nil
+        }
+        func record(_ arguments: [String]) throws {
+            argvList.append(arguments)
+            if let error { throw error }
+        }
+    }
+
     @MainActor
     private func makeDefaults(enablingLinkage: Bool = false) -> (UserDefaults, String) {
         let suiteName = "FocusModeLinkageTests.\(UUID().uuidString)"
@@ -82,7 +95,8 @@ final class FocusModeLinkageTests: XCTestCase {
         ),
         openHandler: @escaping (URL) -> Bool = { _ in true },
         interOpenDelay: TimeInterval = 0,
-        appWakeCount: AppWakeCounter? = nil
+        appWakeCount: AppWakeCounter? = nil,
+        syncLaunchRecorder: SyncLaunchRecorder? = nil
     ) -> FocusModeBridge {
         FocusModeBridge(
             runner: runner,
@@ -90,7 +104,15 @@ final class FocusModeLinkageTests: XCTestCase {
             focusTargetProvider: { target },
             openHandler: openHandler,
             interOpenDelay: interOpenDelay,
-            ensureAppRunning: { appWakeCount?.record() }
+            ensureAppRunning: { appWakeCount?.record() },
+            synchronousLauncher: { arguments in
+                if let syncLaunchRecorder {
+                    try syncLaunchRecorder.record(arguments)
+                } else {
+                    // 测试没显式指认时也不能真拉起系统进程。
+                    NSLog("测试桩拦截同步启动：\(arguments)")
+                }
+            }
         )
     }
 
@@ -327,6 +349,84 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertEqual(second, .unknown)
         XCTAssertEqual(bridge.lastKnownExistence, .ready, "unknown 不覆盖旧结论")
         XCTAssertNotEqual(bridge.lastExistenceCheckDate, firstDate)
+    }
+
+    // MARK: - 退出路径同步拉起（codex 评审 ③）
+
+    @MainActor
+    func testTerminateLaunchesOffShortcutSynchronouslyOnlyWhenEngaged() {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let recorder = SyncLaunchRecorder()
+        let bridge = makeBridge(runner: RunnerStub().runner, syncLaunchRecorder: recorder)
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+
+        // 没联动时退出：不该拉任何东西。
+        manager.handleAppWillTerminate()
+        XCTAssertEqual(recorder.argvList, [], "未联动时退出不应执行指令")
+
+        manager.startFocus()
+        manager.handleAppWillTerminate()
+        XCTAssertEqual(recorder.argvList.count, 1)
+        XCTAssertEqual(
+            recorder.argvList.first,
+            ["/usr/bin/shortcuts", "run", "Restly 专注关闭"],
+            "退出要同步拉起关闭指令"
+        )
+
+        // 再触发一次不该重复（联动已在退出时视为关闭）。
+        manager.handleAppWillTerminate()
+        XCTAssertEqual(recorder.argvList.count, 1)
+    }
+
+    @MainActor
+    func testSyncLaunchFailureIsContainedWithoutCrashing() {
+        let recorder = SyncLaunchRecorder(shouldFail: true)
+        let bridge = makeBridge(runner: RunnerStub().runner, syncLaunchRecorder: recorder)
+        // 抛错必须在 bridge 内被吃掉（留痕即可），不能炸出调用方。
+        bridge.launchOffShortcutSynchronously()
+        XCTAssertEqual(recorder.argvList.count, 1)
+    }
+
+    // MARK: - 熔断复位（codex 评审 ①）
+
+    @MainActor
+    func testReadyExistenceCheckResetsMissingCircuitBreaker() async {
+        let stub = RunnerStub(responses: [
+            (1, "找不到快捷指令"),   // run 失败
+            (0, ""),                // list：缺失 → 熔断
+            (0, "设定专注模式\n关闭专注模式\n"),  // 用户补齐后的检查 → ready
+            (0, ""),                // 复位后的真正执行
+        ])
+        let bridge = makeBridge(
+            runner: stub.runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式")
+        )
+
+        _ = await bridge.setFocusEngaged(true)
+        XCTAssertTrue(bridge.isMissing)
+
+        // 用户恢复走的是设置页的强制重检路径（教程完成/重新检测按钮）。
+        let existence = await bridge.checkShortcutsExist(forceRefresh: true)
+        XCTAssertEqual(existence, .ready)
+        XCTAssertFalse(bridge.isMissing, "检测到就绪应复位熔断，否则执行继续短路直到重启")
+
+        let result = await bridge.setFocusEngaged(true)
+        guard case .success = result else {
+            return XCTFail("熔断复位后应真正执行，实际 \(result)")
+        }
+        XCTAssertEqual(stub.invocations.filter { $0.command == "run" }.count, 2, "第二次 run 要真的跑出去")
+    }
+
+    // MARK: - 安装等待页让位语义（codex 评审 ②）
+
+    func testInstallSheetPresentationStateYieldsToOutcome() {
+        // 结局未定：到点呈现等待页；结局已定：让位（nil），终态由结局任务写。
+        XCTAssertEqual(
+            SettingsView.installSheetPresentationState(hasOutcome: false),
+            .waiting(remainingSeconds: 30)
+        )
+        XCTAssertNil(SettingsView.installSheetPresentationState(hasOutcome: true))
     }
 
     // MARK: - 名字可配置

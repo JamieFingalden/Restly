@@ -304,6 +304,13 @@ struct SettingsView: View {
     private static let installTotalSeconds = 30
     private static let installPollInterval: TimeInterval = 2
 
+    /// 呈现任务到点时该把 sheet 置成什么：流程已有结局就让位（nil，
+    /// 结局任务会写自己的终态），仍未定才上等待页。调用点与结局写入
+    /// 全部在主线程串行执行，配合取消标志不存在交错。
+    static func installSheetPresentationState(hasOutcome: Bool) -> FocusLinkageInstallSheetState? {
+        hasOutcome ? nil : .waiting(remainingSeconds: installTotalSeconds)
+    }
+
     /// 一键创建：生成文件并交给快捷指令 App，随后有界轮询等用户
     /// 点完「添加快捷指令」。生成/打开失败带原因进 sheet，绝不静默。
     private func runAutomaticInstall() {
@@ -315,12 +322,16 @@ struct SettingsView: View {
         installSheetPresentationTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
-            installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
+            installSheet = Self.installSheetPresentationState(hasOutcome: false)
         }
         installTask = Task {
             let outcome = await focusModeBridge.installShortcuts()
             DebugEventLog.shared.log("一键创建：installShortcuts 返回 \(outcome)")
             if Task.isCancelled { return }
+            // 结局先到（生成/打开在 400ms 内就失败过）：取消呈现任务，
+            // 否则它到点把状态改回 .waiting，sheet 卡在等待态没有重试
+            // 入口。取消与写入都在主线程串行，不会交错。
+            installSheetPresentationTask?.cancel()
             switch outcome {
             case .opened:
                 break

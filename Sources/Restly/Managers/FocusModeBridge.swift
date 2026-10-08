@@ -126,7 +126,8 @@ final class FocusModeBridge: ObservableObject {
         existenceCacheTTL: TimeInterval = 60,
         openHandler: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
         interOpenDelay: TimeInterval = 1.0,
-        ensureAppRunning: AppRunningEnsurer? = nil
+        ensureAppRunning: AppRunningEnsurer? = nil,
+        synchronousLauncher: @escaping (_ arguments: [String]) throws -> Void = FocusModeBridge.launchProcess
     ) {
         self.runner = runner ?? Self.defaultRunner(workQueue: workQueue)
         self.namesProvider = namesProvider
@@ -135,7 +136,11 @@ final class FocusModeBridge: ObservableObject {
         self.openHandler = openHandler
         self.interOpenDelay = interOpenDelay
         self.ensureAppRunning = ensureAppRunning ?? Self.wakeShortcutsAppInBackground
+        self.synchronousLauncher = synchronousLauncher
     }
+
+    /// 退出路径的同步子进程启动器，注入以便测试记录 argv。
+    private let synchronousLauncher: (_ arguments: [String]) throws -> Void
 
     /// 后台拉起快捷指令 App（不抢焦点），再留一秒余量等它的 XPC
     /// 服务可用 —— sign 依赖 App 在跑，否则报误导性的「格式不正确」。
@@ -192,6 +197,7 @@ final class FocusModeBridge: ObservableObject {
         if !forceRefresh, let cache = existenceCache,
            cache.names == currentNames,
            Date().timeIntervalSince(cache.timestamp) < existenceCacheTTL {
+            resetMissingIfReady(cache.result)
             return cache.result
         }
 
@@ -205,6 +211,7 @@ final class FocusModeBridge: ObservableObject {
             : .missing
         existenceCache = (currentNames, result, Date())
         recordExistence(result)
+        resetMissingIfReady(result)
         return result
     }
 
@@ -230,6 +237,30 @@ final class FocusModeBridge: ObservableObject {
         }
         let present = Set(available)
         return [currentNames.on, currentNames.off].filter { !present.contains($0) }
+    }
+
+    /// 退出专用：同步 fire-and-forget 地拉起关闭子进程。
+    ///
+    /// willTerminate 之后主 actor 随时可能停摆，任何 Task/await 排队
+    /// 都可能没轮到执行，专注模式就被留在开着的状态 —— Process.run()
+    /// 同步把子进程拉起（不 waitUntilExit），它独立于父进程存活。
+    /// 拉起失败只留痕：下次启动恢复 running focus 时会重新联动。
+    func launchOffShortcutSynchronously() {
+        let currentNames = names
+        do {
+            try synchronousLauncher(["/usr/bin/shortcuts", "run", currentNames.off])
+            DebugEventLog.shared.log("退出：已同步拉起关闭指令「\(currentNames.off)」")
+        } catch {
+            DebugEventLog.shared.log("退出：拉起关闭指令失败 —— \(error.localizedDescription)")
+            NSLog("Restly 退出时无法执行关闭快捷指令：\(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func launchProcess(_ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: arguments[0])
+        process.arguments = Array(arguments.dropFirst())
+        try process.run()
     }
 
     // MARK: - 一键创建
@@ -597,6 +628,16 @@ final class FocusModeBridge: ObservableObject {
         if result != .unknown {
             lastKnownExistence = result
         }
+    }
+
+    /// 检查（无论走缓存还是真跑）给出 .ready 就复位熔断 —— 不变量是
+    /// 「UI 显示就绪，执行就不能短路」：用户照指引手动建好指令/改对
+    /// 指认后，不复位的话执行会一直缺席直到重启。缓存命中的 ready
+    /// 同样算数；unknown 不复位（没证据就别动开关）。
+    private func resetMissingIfReady(_ result: Existence) {
+        guard result == .ready, isMissing else { return }
+        isMissing = false
+        DebugEventLog.shared.log("联动熔断复位：检测到两条指令均已就位")
     }
 
     private func run(_ arguments: [String]) async -> (Int32, String) {
