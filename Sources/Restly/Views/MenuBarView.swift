@@ -1,129 +1,120 @@
 import AppKit
 import SwiftUI
 
+/// 菜单栏的原生菜单内容（macOS 官方 NSMenu 样式，`.menuBarExtraStyle(.menu)`）。
+/// ⚠️ 只用标准构造：Button / Divider / Section(标题) / Menu。曾经把 `Text`
+/// 直接当菜单项用，结果渲染高度和 NSMenu 条目槽位对不齐，命中测试整体
+/// 上移一行（鼠标在「暂停」却高亮「短休息」）—— 非标准内容会破坏对齐。
+/// 纯信息行用 `Button(...).disabled(true)` 占标准槽位；番茄钟的阶段和
+/// 倒计时做成分节标题，操作项就是它的内容。倒计时文字是构建菜单那一刻
+/// 的快照，重新打开菜单就会拿到新值；实时跳动在菜单栏图标旁。
 struct MenuBarView: View {
-    @Environment(\.dismiss) private var dismiss
     @ObservedObject var manager: ReminderManager
+    @ObservedObject var pomodoroManager: PomodoroManager
     let settingsWindowController: SettingsWindowController
 
     var body: some View {
-        Group {
-            if #available(macOS 26.0, *) {
-                GlassEffectContainer(spacing: 12) {
-                    menuContent
-                }
-            } else {
-                menuContent
+        Button(statusLine) {}
+            .disabled(true)
+
+        Divider()
+
+        pomodoroSection
+
+        Divider()
+
+        Section("提醒") {
+            ForEach(ReminderType.allCases) { type in
+                Button("\(type.title) · \(manager.remainingDescription(for: type))") {}
+                    .disabled(true)
             }
         }
-        .padding(16)
-        .frame(width: 330)
-        .restlyWindowGlass(cornerRadius: 22)
-        .onAppear {
-            manager.refreshActivityStatus()
-            makeMenuWindowTransparent()
+
+        Divider()
+
+        pauseMenu
+        Button("设置…") {
+            settingsWindowController.show()
+        }
+        Divider()
+        Button("退出 Restly") {
+            NSApp.terminate(nil)
         }
     }
 
-    private var menuContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            header
+    // MARK: - 状态
 
-            if let pauseDescription = manager.pauseDescription() {
-                Label(pauseDescription, systemImage: "pause.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .padding(.horizontal, 4)
-            }
-
-            reminderList
-
-            Divider().opacity(0.45)
-
-            footer
-        }
+    private var statusLine: String {
+        if manager.isPaused() { return "提醒已暂停" }
+        if !manager.isScreenAvailable { return "提醒已停止" }
+        return "提醒计时中"
     }
 
-    private var header: some View {
-        HStack(spacing: 10) {
-            RestlyBrandMark(size: 36)
+    // MARK: - 番茄钟
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Restly")
-                    .font(.system(size: 17, weight: .bold, design: .rounded))
-                Text("休息得刚刚好")
-                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            activityBadge
-        }
-    }
-
-    private var activityBadge: some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(activityColor)
-                .frame(width: 6, height: 6)
-            Text(manager.activityState.description)
-                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
-        }
-        .foregroundStyle(activityColor)
-        .padding(.horizontal, 9)
-        .padding(.vertical, 6)
-        .restlyClearGlassSurface(cornerRadius: 20, tint: activityColor.opacity(0.16))
-        .accessibilityElement(children: .combine)
-    }
-
-    private var reminderList: some View {
-        VStack(spacing: 0) {
-            ForEach(Array(ReminderType.allCases.enumerated()), id: \.element.id) { index, type in
-                ReminderRow(
-                    type: type,
-                    remaining: manager.remainingDescription(for: type)
-                )
-                if index < ReminderType.allCases.count - 1 {
-                    Divider()
-                        .padding(.leading, 52)
+    /// 阶段 + 倒计时做分节标题，操作做条目 —— 状态和动作天然归在一组。
+    @ViewBuilder
+    private var pomodoroSection: some View {
+        switch pomodoroManager.session.status {
+        case nil:
+            Section("番茄钟 · \(pomodoroManager.focusSummaryText)") {
+                Button("开始专注") {
+                    pomodoroManager.startFocus()
                 }
             }
+        case .running:
+            Section("\(activeTitle) · \(pomodoroManager.countdownText(at: Date()) ?? "0:00")") {
+                Button("暂停") {
+                    pomodoroManager.pause()
+                }
+                Button("跳过\(phaseTitle)") {
+                    pomodoroManager.skip()
+                }
+                Button("停止番茄钟") {
+                    pomodoroManager.stop()
+                }
+            }
+        case .paused:
+            Section("\(activeTitle) · 已暂停 · \(pomodoroManager.countdownText(at: Date()) ?? "0:00")") {
+                Button("继续") {
+                    pomodoroManager.resume()
+                }
+                Button("跳过\(phaseTitle)") {
+                    pomodoroManager.skip()
+                }
+                Button("停止番茄钟") {
+                    pomodoroManager.stop()
+                }
+            }
+        case .awaitingStart:
+            Section("下一阶段 · \(phaseTitle)") {
+                Button("开始\(phaseTitle)") {
+                    pomodoroManager.startPendingPhase()
+                }
+                Button("跳过") {
+                    pomodoroManager.skip()
+                }
+            }
         }
-        .padding(4)
-        .restlyClearGlassSurface(cornerRadius: 14)
     }
 
-    private var footer: some View {
-        HStack(spacing: 12) {
-            pauseMenu
-            Spacer()
-            Button {
-                let menuWindow = NSApp.keyWindow
-                dismiss()
-                menuWindow?.orderOut(nil)
-                settingsWindowController.perform(
-                    #selector(SettingsWindowController.show),
-                    with: nil,
-                    afterDelay: 0.08
-                )
-            } label: {
-                Label("设置", systemImage: "gearshape")
-            }
-            Button {
-                NSApp.terminate(nil)
-            } label: {
-                Image(systemName: "power")
-            }
-            .help("退出 Restly")
+    private var activeTitle: String {
+        switch pomodoroManager.session.phase {
+        case .focus: "专注"
+        case .shortBreak: "短休息"
+        case .longBreak: "长休息"
+        case nil: "番茄钟"
         }
-        .font(.system(size: 12, weight: .medium, design: .rounded))
-        .controlSize(.small)
-        .restlyGlassButtonStyle()
     }
+
+    private var phaseTitle: String {
+        pomodoroManager.session.phase?.title ?? ""
+    }
+
+    // MARK: - 暂停提醒
 
     private var pauseMenu: some View {
-        Menu {
+        Menu(manager.isPaused() ? "已暂停" : "暂停提醒") {
             if manager.isPaused() {
                 Button("恢复提醒") {
                     manager.resume()
@@ -139,27 +130,10 @@ struct MenuBarView: View {
             Button("暂停 2 小时") {
                 manager.pause(for: 120)
             }
-        } label: {
-            Label(manager.isPaused() ? "已暂停" : "暂停提醒", systemImage: "pause.fill")
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .restlyGlassButtonStyle()
-    }
-
-    private func makeMenuWindowTransparent() {
-        DispatchQueue.main.async {
-            guard let window = NSApp.keyWindow else { return }
-            window.isOpaque = false
-            window.backgroundColor = .clear
-        }
-    }
-
-    private var activityColor: Color {
-        switch manager.activityState {
-        case .active: Color(red: 0.12, green: 0.62, blue: 0.43)
-        case .idle: Color(red: 0.9, green: 0.56, blue: 0.12)
-        case .away, .sleeping: .secondary
+            Divider()
+            Button("暂停到我手动恢复") {
+                manager.pauseIndefinitely()
+            }
         }
     }
 }

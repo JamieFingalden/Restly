@@ -26,4 +26,21 @@ struct RuntimeConfiguration {
         case .stand: return TimeInterval(settings.standIntervalMinutes * 60)
         }
     }
+
+    @MainActor
+    func pomodoroDuration(for phase: PomodoroSession.Phase, settings: ReminderSettings) -> TimeInterval {
+        if isDevelopmentMode {
+            switch phase {
+            case .focus: return 30
+            case .shortBreak: return 10
+            case .longBreak: return 20
+            }
+        }
+
+        switch phase {
+        case .focus: return TimeInterval(settings.pomodoroFocusMinutes * 60)
+        case .shortBreak: return TimeInterval(settings.pomodoroShortBreakMinutes * 60)
+        case .longBreak: return TimeInterval(settings.pomodoroLongBreakMinutes * 60)
+        }
+    }
 }

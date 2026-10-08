@@ -1,80 +1,102 @@
 # Restly
 
-Restly 是一个轻量的原生 macOS 菜单栏健康提醒工具。它根据真实键盘、鼠标 Idle 状态计算电脑使用时间，并提醒喝水、休息眼睛和站起来活动。
+[中文说明](README.zh-CN.md)
 
-## 系统要求
+Restly is a lightweight, native macOS menu bar app that reminds you to drink water, rest your eyes, and stand up — plus a pomodoro timer for focused work.
 
-- macOS 13 或更高版本
-- App 运行不依赖 Xcode 或开发环境
-- 构建需要 Xcode Command Line Tools
+It doesn't track keyboard or mouse activity. Instead, the question of "is the user away" is left entirely to macOS — locking the screen, display sleep, closing the lid, or switching users all count as leaving. This works beautifully with video players and meeting apps, which actively prevent display sleep: watching a movie or joining a video call won't be misjudged as being away, even though that's exactly when eye-rest reminders matter most.
 
-## 安装和使用
+## Requirements
 
-打开：
+- macOS 13 or later
+- The app runs without Xcode or any development tools
+- Building from source requires Xcode Command Line Tools
 
-```text
-dist/Restly.dmg
-```
+## Install & Use
 
-将 `Restly.app` 拖到 DMG 中的 `Applications` 快捷方式。启动后 Restly 不显示 Dock 图标，入口位于屏幕右上角菜单栏的眼睛图标。
+Open [`dist/Restly.dmg`](dist/Restly.dmg) and drag `Restly.app` onto the `Applications` shortcut inside the DMG.
 
-首次启动时，macOS 会请求通知权限。喝水与站立使用系统通知，护眼提醒使用覆盖所有显示器的沉浸式全屏界面。
+Once launched, Restly shows no Dock icon. It lives in the top-right menu bar behind a heart icon; while paused, the icon becomes a crossed-out heart.
 
-## 功能
+Restly never uses system notifications and never asks for notification permission. Water and stand reminders appear in custom-drawn floating windows; eye rest takes over every display with a full-screen overlay.
 
-- 三种提醒共享一个低频调度器
-- 喝水通知：已喝水、10 分钟后提醒
-- 全屏护眼界面：系统背景模糊、圆形倒计时、`Esc` 跳过、稍后提醒、自动关闭
-- 久坐通知：我起来了、10 分钟后提醒
-- 根据键盘和鼠标 Idle 时间暂停连续使用计时
-- 离开电脑后重新开始护眼和久坐计时
-- 正确处理锁屏、睡眠、合盖与唤醒，不补发历史提醒
-- 暂停 30 分钟、1 小时或 2 小时
-- UserDefaults 本地设置
-- 使用系统登录项服务自动启动
-- 无账号、后端、网络服务或数据库
+## Features
 
-## 构建
+- All three reminders share a single timer scheduled directly on the next trigger point, so the CPU wakes up only once every few dozen minutes in normal use
+- **Water**: floating window with "Done" and "Remind me in 5 minutes"
+- **Stand**: floating window with "I'm up" and "Remind me in 5 minutes", plus an optional click-to-lock action (uses the native system lock screen — same path as Ctrl+Cmd+Q, with fade-in animation)
+- **Eye rest**: full-screen overlay with a pure black background, circular countdown, `Esc` to skip, "Remind me in 10 minutes", and auto-close when the countdown ends
+- **Pomodoro**: focus/short-break/long-break cycles with configurable durations and long-break interval; while running, the menu bar shows a live countdown next to the heart icon
+- Breaks auto-start when a focus ends (configurable); after a break, the next focus waits for you to press start — no mindless tomato chains
+- Locking the screen freezes a running pomodoro and resumes it on unlock; a running pomodoro also survives app restarts (if the app was closed longer than the remaining time, that tomato counts as completed)
+- Lock screen / display sleep / lid close / fast user switch all count as being away — no timers tick, no reminders pop
+- Coming back after being away longer than the threshold (2 minutes by default) resets the eye-rest and stand timers; the water timer is *not* reset, because being away doesn't mean you drank anything
+- Absences shorter than the threshold are ignored, and frozen time is added back
+- Pause for 30 minutes, 1 hour, 2 hours, or until manually resumed
+- Changing one reminder's settings never resets another's running timer
+- Settings stored locally in UserDefaults; launch-at-login via the system login-item service
+- No accounts, no backend, no network services, no database
+
+## Settings
+
+- **Reminders**: per-type switches and intervals, eye-rest duration, whether floating windows auto-dismiss after 5 seconds, and the away-reset threshold
+- **Pomodoro**: focus/short-break/long-break durations, long-break interval, auto-start behavior, and whether the menu bar shows the countdown
+- **General**: launch at login
+
+## Build
 
 ```bash
 ./scripts/build.sh
 ```
 
-该命令会生成：
+This produces:
 
 ```text
 dist/Restly.app
 dist/Restly.dmg
 ```
 
-App 使用 ad-hoc 本地签名，适合个人本机使用，不包含 Developer ID 或公证流程。
+The app is ad-hoc signed locally, which is fine for personal use; there is no Developer ID signing or notarization pipeline.
 
-## 开发模式
+## Development Mode
 
-开发模式使用护眼 30 秒、喝水 60 秒、站立 90 秒，不会修改正式设置：
+Development mode shortens intervals to 30s (eye rest) / 60s (water) / 90s (stand) and pomodoro phases to 30s / 10s / 20s, without touching your real settings:
 
 ```bash
 swift run Restly --development-mode
 ```
 
-也可以运行已构建的 App：
+Or run an already-built app:
 
 ```bash
 RESTLY_DEVELOPMENT_MODE=1 ./dist/Restly.app/Contents/MacOS/Restly
 ```
 
-开发模式的设置页还提供“立即测试护眼浮层”按钮。
+In development mode, the settings window also exposes a "Test Full-Screen Eye Rest Now" button.
 
-要在启动后立即显示护眼浮层，可以使用：
+Available debug flags:
 
-```bash
-./dist/Restly.app/Contents/MacOS/Restly --development-mode --show-eye-rest
-```
+| Flag | Effect |
+| --- | --- |
+| `--development-mode` | Shorten all three reminder intervals and the pomodoro phases |
+| `--show-eye-rest` | Show the full-screen eye rest 1s after launch |
+| `--show-settings` | Open the settings window at launch |
+| `--show-menu-preview` | Show the menu bar panel as a standalone window |
+| `--show-water-preview` | Pop the water reminder immediately |
+| `--show-stand-preview` | Pop the stand reminder immediately |
+| `--show-pomodoro-preview` | Pop the pomodoro phase-end toast immediately |
+| `--open-menu` | Click the real menu bar panel open 2s after launch (for debugging/screenshots) |
 
-要直接检查设置窗口，可以附加 `--show-settings`。
-
-## 测试
+## Tests
 
 ```bash
 swift test
 ```
+
+## Contributing
+
+Issues and pull requests are welcome! Please open an issue first to discuss significant changes.
+
+## License
+
+[MIT](LICENSE)

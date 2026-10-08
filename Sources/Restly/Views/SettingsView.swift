@@ -67,8 +67,8 @@ struct SettingsView: View {
         switch selectedSection {
         case .reminders:
             reminderSettings
-        case .activity:
-            activitySettings
+        case .pomodoro:
+            pomodoroSettings
         case .general:
             generalSettings
         }
@@ -173,31 +173,77 @@ struct SettingsView: View {
                     .font(.system(size: 12, design: .rounded))
                     .foregroundStyle(.secondary)
                 }
+
+                SettingsCard(
+                    title: "离开重置",
+                    subtitle: "锁屏、息屏或合盖多久算一次真正的休息",
+                    systemImage: "arrow.counterclockwise",
+                    tint: .orange
+                ) {
+                    NumberSettingRow(
+                        title: "离开超过",
+                        value: $settings.lockResetThresholdMinutes,
+                        range: 1...30,
+                        step: 1,
+                        unit: "分钟"
+                    )
+                    SettingsDivider()
+                    Label(
+                        "离开超过 \(settings.lockResetThresholdMinutes) 分钟，护眼和站立计时从零开始 —— 眼睛已经离开屏幕，人也站起来过了。喝水不重置，离开不代表喝了水。",
+                        systemImage: "info.circle"
+                    )
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(24)
         }
         .scrollIndicators(.hidden)
     }
 
-    private var activitySettings: some View {
+    private var pomodoroSettings: some View {
         ScrollView {
             VStack(spacing: 14) {
                 SettingsCard(
-                    title: "活动检测",
-                    subtitle: "根据键盘、鼠标和触控板输入判断是否计时",
-                    systemImage: "cursorarrow.motionlines",
-                    tint: .orange
+                    title: "番茄钟",
+                    subtitle: "专注与休息的循环",
+                    systemImage: "timer",
+                    tint: Color(red: 0.85, green: 0.32, blue: 0.26)
                 ) {
-                    NumberSettingRow(
-                        title: "无操作后暂停",
-                        value: $settings.idleThresholdMinutes,
-                        range: 1...15,
-                        step: 1,
-                        unit: "分钟"
-                    )
+                    Group {
+                        NumberSettingRow(
+                            title: "专注时长",
+                            value: $settings.pomodoroFocusMinutes,
+                            range: 5...120,
+                            step: 5,
+                            unit: "分钟"
+                        )
+                        NumberSettingRow(
+                            title: "短休息",
+                            value: $settings.pomodoroShortBreakMinutes,
+                            range: 1...30,
+                            step: 1,
+                            unit: "分钟"
+                        )
+                        NumberSettingRow(
+                            title: "长休息",
+                            value: $settings.pomodoroLongBreakMinutes,
+                            range: 5...60,
+                            step: 5,
+                            unit: "分钟"
+                        )
+                        NumberSettingRow(
+                            title: "长休息间隔",
+                            value: $settings.pomodoroLongBreakEvery,
+                            range: 2...8,
+                            step: 1,
+                            unit: "个番茄"
+                        )
+                    }
                     SettingsDivider()
                     Label(
-                        "连续 \(settings.awayThresholdMinutes) 分钟未检测到输入后，护眼与久坐计时会重新开始。",
+                        "修改时长只影响下一段开始的计时，进行中的阶段不受影响。",
                         systemImage: "info.circle"
                     )
                     .font(.system(size: 12, design: .rounded))
@@ -205,19 +251,25 @@ struct SettingsView: View {
                 }
 
                 SettingsCard(
-                    title: "当前状态",
-                    subtitle: manager.activityState.description,
-                    systemImage: activitySystemImage,
-                    tint: activityTint
+                    title: "阶段流转",
+                    subtitle: "一段结束后下一段怎么开始",
+                    systemImage: "arrow.2.circlepath",
+                    tint: .orange
                 ) {
-                    HStack {
-                        Text("最近一次输入")
-                        Spacer()
-                        Text(idleDescription)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    Toggle("专注结束后自动开始休息", isOn: $settings.pomodoroAutoStartBreak)
+                    SettingsDivider()
+                    Toggle("休息结束后自动开始下一个专注", isOn: $settings.pomodoroAutoStartFocus)
+                    SettingsDivider()
+                    Toggle("在菜单栏显示倒计时", isOn: $settings.pomodoroShowsInMenuBar)
+                    SettingsDivider()
+                    Label(
+                        settings.pomodoroAutoStartBreak
+                            ? "专注一结束就进入休息，转段时浮窗通知。"
+                            : "专注结束后浮窗询问，点「开始休息」才计时。",
+                        systemImage: "info.circle"
+                    )
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundStyle(.secondary)
                 }
             }
             .padding(24)
@@ -256,7 +308,7 @@ struct SettingsView: View {
                         systemImage: "hammer.fill",
                         tint: .purple
                     ) {
-                        Text("护眼 30 秒、喝水 60 秒、站立 90 秒")
+                        Text("护眼 30 秒、喝水 60 秒、站立 90 秒；番茄钟 30/10/20 秒")
                             .font(.system(size: 12, design: .rounded))
                             .foregroundStyle(.secondary)
                         Button("立即测试全屏护眼") {
@@ -270,37 +322,15 @@ struct SettingsView: View {
         .scrollIndicators(.hidden)
     }
 
-    private var idleDescription: String {
-        let seconds = Int(manager.idleSeconds)
-        if seconds < 60 { return "\(seconds) 秒前" }
-        return "\(seconds / 60) 分钟前"
-    }
-
     private var appVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.3"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
     }
 
-    private var activitySystemImage: String {
-        switch manager.activityState {
-        case .active: "bolt.fill"
-        case .idle: "pause.fill"
-        case .away: "arrow.counterclockwise"
-        case .sleeping: "moon.zzz.fill"
-        }
-    }
-
-    private var activityTint: Color {
-        switch manager.activityState {
-        case .active: .green
-        case .idle: .orange
-        case .away, .sleeping: .secondary
-        }
-    }
 }
 
 private enum SettingsSection: String, CaseIterable, Identifiable {
     case reminders
-    case activity
+    case pomodoro
     case general
 
     var id: String { rawValue }
@@ -308,7 +338,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .reminders: "提醒"
-        case .activity: "活动检测"
+        case .pomodoro: "番茄钟"
         case .general: "通用"
         }
     }
@@ -316,7 +346,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .reminders: "bell.fill"
-        case .activity: "waveform.path.ecg"
+        case .pomodoro: "timer"
         case .general: "gearshape.fill"
         }
     }
@@ -391,9 +421,6 @@ private struct NumberSettingRow: View {
                 .textFieldStyle(.roundedBorder)
                 .multilineTextAlignment(.trailing)
                 .frame(width: 68)
-                .onSubmit {
-                    value = min(max(value, range.lowerBound), range.upperBound)
-                }
             Text(unit)
                 .foregroundStyle(.secondary)
                 .frame(width: 34, alignment: .leading)

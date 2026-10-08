@@ -10,10 +10,23 @@ private struct ScreenLockRequest {
     let onLock: () -> Void
 }
 
+/// 番茄钟转段通知。带展示文案和按钮闭包，由 `PomodoroManager` 组装 ——
+/// 它需要跨文件使用，所以不像其它两个 Request 一样藏成 private。
+struct PomodoroToastRequest {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let primaryTitle: String
+    let primaryAction: () -> Void
+    var secondaryTitle: String?
+    var secondaryAction: (() -> Void)?
+}
+
 private enum ActiveToastContent {
     case health(HealthToast)
     case eyeRest(EyeRestHeadsUpRequest)
     case screenLock(ScreenLockRequest)
+    case pomodoro(PomodoroToastRequest)
 }
 
 private enum ToastDismissAction {
@@ -22,6 +35,8 @@ private enum ToastDismissAction {
     case snoozeEyeRest
     case lockScreen
     case cancelScreenLock
+    case pomodoroPrimary
+    case pomodoroSecondary
 }
 
 @MainActor
@@ -38,6 +53,7 @@ final class ToastManager: NSObject {
     private var activeContent: ActiveToastContent?
     private var pendingEyeRestHeadsUp: EyeRestHeadsUpRequest?
     private var pendingScreenLock: ScreenLockRequest?
+    private var pendingPomodoro: PomodoroToastRequest?
     private var activePanel: HealthToastPanel?
     private var presentation: ToastPresentationState?
     private var autoDismissTask: Task<Void, Never>?
@@ -85,6 +101,13 @@ final class ToastManager: NSObject {
         presentNextIfPossible()
     }
 
+    /// 番茄钟每次转段最多一条通知，新的转段直接覆盖还没轮到展示的旧请求 ——
+    /// 过期的「开始休息」弹出来只会让人困惑，最新的状态才有意义。
+    func showPomodoroToast(_ request: PomodoroToastRequest) {
+        pendingPomodoro = request
+        presentNextIfPossible()
+    }
+
     func suspendQueue() {
         isQueueSuspended = true
     }
@@ -112,6 +135,26 @@ final class ToastManager: NSObject {
         }
     }
 
+    /// 收掉番茄钟通知（pending 和正在显示的都算）。
+    /// 锁屏、跳过、停止时由 PomodoroManager 调 —— 别把「开始休息」
+    /// 留在锁屏后面，也别在用户已经手动操作后再弹过期的建议。
+    func cancelPomodoroToast() {
+        pendingPomodoro = nil
+        if case .pomodoro = activeContent {
+            dismissActive(action: nil)
+        } else {
+            presentNextIfPossible()
+        }
+    }
+
+    /// 关掉当前正在显示的喝水/站立浮窗。
+    /// 锁屏和暂停时用 —— `suspendQueue()` 只拦后面排队的，
+    /// 已经显示出来的那个从前会一直挂在屏幕上。
+    func dismissActiveHealthToast() {
+        guard case .health = activeContent else { return }
+        dismissActive(action: nil)
+    }
+
     private func presentNextIfPossible() {
         guard activeContent == nil,
               activePanel == nil,
@@ -129,6 +172,14 @@ final class ToastManager: NSObject {
         if let request = pendingEyeRestHeadsUp {
             pendingEyeRestHeadsUp = nil
             presentEyeRestHeadsUp(request, on: screen)
+            return
+        }
+
+        // 番茄钟排在护眼之后、普通队列之前：前两者到点会自动执行动作，
+        // 番茄钟通知不自动执行任何按钮，错过只损失一条信息。
+        if let request = pendingPomodoro {
+            pendingPomodoro = nil
+            presentPomodoroToast(request, on: screen)
             return
         }
 
@@ -212,6 +263,28 @@ final class ToastManager: NSObject {
                     countdown?.update(seconds: seconds)
                 }
             }
+        }
+    }
+
+    private func presentPomodoroToast(
+        _ request: PomodoroToastRequest,
+        on screen: NSScreen
+    ) {
+        let presentation = ToastPresentationState()
+        let panel = makePomodoroPanel(request: request, presentation: presentation)
+        display(
+            panel,
+            content: .pomodoro(request),
+            presentation: presentation,
+            on: screen
+        )
+
+        // 始终自动收起，收起动作是 nil：番茄钟通知不代替用户做流转决定，
+        // 持久的操作面是菜单窗里的卡片，Toast 只负责把注意力拉过去。
+        autoDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: self?.autoDismissDuration ?? .seconds(5))
+            guard !Task.isCancelled else { return }
+            self?.dismissActive(action: nil)
         }
     }
 
@@ -307,6 +380,29 @@ final class ToastManager: NSObject {
         return panel
     }
 
+    private func makePomodoroPanel(
+        request: PomodoroToastRequest,
+        presentation: ToastPresentationState
+    ) -> HealthToastPanel {
+        let panel = makeBasePanel()
+        let hostingView = FirstMouseHostingView(
+            rootView: PomodoroToastView(
+                request: request,
+                presentation: presentation,
+                onPrimary: { [weak self] in
+                    self?.dismissActive(action: .pomodoroPrimary)
+                },
+                onSecondary: { [weak self] in
+                    self?.dismissActive(action: .pomodoroSecondary)
+                }
+            )
+        )
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = NSColor.clear.cgColor
+        panel.contentView = hostingView
+        return panel
+    }
+
     private func makeBasePanel() -> HealthToastPanel {
         let panel = HealthToastPanel(
             contentRect: NSRect(origin: .zero, size: panelSize),
@@ -376,6 +472,10 @@ final class ToastManager: NSObject {
             request.onSnooze()
         case (.screenLock(let request), .lockScreen):
             request.onLock()
+        case (.pomodoro(let request), .pomodoroPrimary):
+            request.primaryAction()
+        case (.pomodoro(let request), .pomodoroSecondary):
+            request.secondaryAction?()
         default:
             break
         }
@@ -610,6 +710,66 @@ private struct ScreenLockCountdownView: View {
                             isPrimary: true
                         )
                     )
+            }
+
+            Spacer(minLength: 0)
+        }
+        .toastChrome(accentColor: accentColor, presentation: presentation)
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct PomodoroToastView: View {
+    let request: PomodoroToastRequest
+    @ObservedObject var presentation: ToastPresentationState
+    let onPrimary: () -> Void
+    let onSecondary: () -> Void
+
+    private let accentColor = Color(red: 0.85, green: 0.32, blue: 0.26)
+
+    var body: some View {
+        HStack(spacing: 11) {
+            ZStack {
+                Circle()
+                    .fill(accentColor.opacity(0.16))
+                Image(systemName: request.systemImage)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(accentColor)
+            }
+            .frame(width: 32, height: 32)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 5) {
+                    Text(request.title)
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                    Text(request.subtitle)
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 6) {
+                    Button(request.primaryTitle, action: onPrimary)
+                        .buttonStyle(
+                            ToastActionButtonStyle(
+                                accentColor: accentColor,
+                                isPrimary: true
+                            )
+                        )
+                    if let secondaryTitle = request.secondaryTitle {
+                        Button(secondaryTitle, action: onSecondary)
+                            .buttonStyle(
+                                ToastActionButtonStyle(
+                                    accentColor: accentColor,
+                                    isPrimary: false
+                                )
+                            )
+                    }
+                }
+                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
             }
 
             Spacer(minLength: 0)
