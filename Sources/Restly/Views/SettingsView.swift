@@ -70,7 +70,7 @@ struct SettingsView: View {
         .sheet(
             isPresented: Binding(
                 get: { installSheet != nil },
-                set: { if !$0 { installSheet = nil } }
+                set: { if !$0 { cancelInstallFlow() } }
             )
         ) {
             FocusLinkageInstallingView(
@@ -80,11 +80,7 @@ struct SettingsView: View {
             ) { state in
                 installSheet = state
             } onCancel: {
-                installTask?.cancel()
-                installTask = nil
-                installSheetPresentationTask?.cancel()
-                installSheetPresentationTask = nil
-                installSheet = nil
+                cancelInstallFlow()
             } onRetry: {
                 installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
                 runAutomaticInstall()
@@ -311,6 +307,23 @@ struct SettingsView: View {
         hasOutcome ? nil : .waiting(remainingSeconds: installTotalSeconds)
     }
 
+    /// 关闭等待页的所有入口（取消按钮、Esc、点外部）都走这里：
+    /// 只清 sheet 不停任务的话，下一轮轮询会把 sheet 再弹回来，
+    /// 用户根本关不掉 —— 实测复现过的 bug。
+    private func cancelInstallFlow() {
+        DebugEventLog.shared.log("一键创建：用户关闭等待页，轮询终止")
+        installTask?.cancel()
+        installTask = nil
+        installSheetPresentationTask?.cancel()
+        installSheetPresentationTask = nil
+        installSheet = nil
+    }
+
+    /// 轮询写等待页前过这道闸：任务已被用户取消就不得再呈现。
+    static func waitingSheetUpdate(isCancelled: Bool, remainingSeconds: Int) -> FocusLinkageInstallSheetState? {
+        isCancelled ? nil : .waiting(remainingSeconds: remainingSeconds)
+    }
+
     /// 一键创建：生成文件并交给快捷指令 App，随后有界轮询等用户
     /// 点完「添加快捷指令」。生成/打开失败带原因进 sheet，绝不静默。
     private func runAutomaticInstall() {
@@ -345,8 +358,11 @@ struct SettingsView: View {
 
             var elapsed = 0
             while elapsed < Self.installTotalSeconds {
+                if Task.isCancelled { return }
                 let remaining = max(0, Self.installTotalSeconds - elapsed)
-                installSheet = .waiting(remainingSeconds: remaining)
+                if let update = Self.waitingSheetUpdate(isCancelled: Task.isCancelled, remainingSeconds: remaining) {
+                    installSheet = update
+                }
                 try? await Task.sleep(for: .seconds(Self.installPollInterval))
                 if Task.isCancelled { return }
                 elapsed += Int(Self.installPollInterval)

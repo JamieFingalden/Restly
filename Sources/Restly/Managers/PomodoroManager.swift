@@ -39,9 +39,14 @@ final class PomodoroManager: ObservableObject {
     /// 由组合根塞一个跳转闭包进来。
     var onRequestOpenSettings: (() -> Void)?
 
-    /// 上一次联动输出值。边沿触发的参照物 —— 进程重启从「未联动」起步，
-    /// 存档恢复出的计时中专注会重新开启联动，与用户预期一致。
-    private var isFocusLinkEngaged = false
+    /// 期望联动态：上一轮结算按「设置开 && 专注段计时中」算出的值。
+    private var isFocusLinkDesired = false
+    /// 已成功应用的联动态：只有 setFocusEngaged 真正成功才推进。
+    /// 失败（缺失熔断等）时保持原值，让 diff 持续看到「想要但没办到」，
+    /// 熔断复位钩子（bridge.onMissingCleared → syncFocusLinkage）或
+    /// 下一次流转会把这笔账补上 —— 用户在专注中途装好指令的场景
+    /// 就靠它把本段专注补进联动，否则要拖到下一段。
+    private var isFocusLinkApplied = false
     /// 缺失提醒每次启动最多一条：连打几颗番茄都失败时，第 2 条起就是噪音。
     private(set) var hasShownFocusLinkageWarning = false
 
@@ -337,8 +342,10 @@ final class PomodoroManager: ObservableObject {
 
     /// 边沿触发的联动对齐点。任何状态流转之后调用：现算应当联动
     /// （设置开 + 专注段计时中；暂停、就绪、休息、锁屏冻结都不算），
-    /// 与上次输出比较，变了才执行快捷指令。
-    private func syncFocusLinkage() {
+    /// 期望态或应用态有缺口才发指令 —— 应用失败会留下缺口，
+    /// 熔断复位钩子会带这里的重跑把账补上。
+    /// internal 是给熔断复位钩子与测试的重跑入口。
+    func syncFocusLinkage() {
         let shouldEngage: Bool
         if settings.pomodoroLinksFocusMode, session.phase == .focus,
            case .running = session.status {
@@ -346,19 +353,26 @@ final class PomodoroManager: ObservableObject {
         } else {
             shouldEngage = false
         }
-        guard shouldEngage != isFocusLinkEngaged else { return }
-        isFocusLinkEngaged = shouldEngage
+        guard shouldEngage != isFocusLinkDesired || shouldEngage != isFocusLinkApplied else { return }
+        isFocusLinkDesired = shouldEngage
 
-        // 快捷指令是异步进程，发出去就不管 —— 状态正确性由本函数
-        // 的 diff 保证，不依赖这条 Task 何时跑完。
+        // 快捷指令是异步进程，发出去就不管。两个 Task 的提交与完成
+        // 都按主线程调度顺序串行，applied 最终等于最后一条成功指令。
         let bridge = focusModeBridge
         let engaged = shouldEngage
         Task { @MainActor in
             let result = await bridge.setFocusEngaged(engaged)
-            if case .failure(.missing) = result {
+            switch result {
+            case .success(()):
+                self.isFocusLinkApplied = engaged
+            case .failure(.missing):
                 self.presentFocusLinkageMissingToast()
+                // applied 不推进：熔断复位的重跑会补上这笔。
+            case .failure(.failed), .failure(.noFocusTarget):
+                // 其它失败 bridge 已留痕：不动状态、不弹框，
+                // 下一次结算（流转或复位钩子）自然会重试。
+                break
             }
-            // 其它失败 bridge 已留痕：不动状态、不弹框，下个边沿自然会重试。
         }
     }
 
@@ -382,8 +396,9 @@ final class PomodoroManager: ObservableObject {
     /// willTerminate 里异步起一个进程没问题 —— 子进程独立存活，
     /// 不等它退出。
     func handleAppWillTerminate() {
-        guard isFocusLinkEngaged else { return }
-        isFocusLinkEngaged = false
+        guard isFocusLinkApplied else { return }
+        isFocusLinkDesired = false
+        isFocusLinkApplied = false
         // 退出路径必须同步把子进程拉起来：Task 排队的话，主 actor
         // 回调一返回进程就可能退出，Task 根本没轮到执行，专注模式
         // 被留在开着的状态。Process.run() 只负责拉起（不等待退出），

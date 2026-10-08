@@ -117,6 +117,11 @@ final class FocusModeBridge: ObservableObject {
     /// 缓存连同当时的名字一起存：用户改指认名字后旧结论一律作废。
     private var existenceCache: (names: ShortcutNames, result: Existence, timestamp: Date)?
 
+    /// 熔断从 true → false（就绪检测复位）时回调一次。PomodoroManager
+    /// 借此重跑联动结算：用户「装好指令时正在计时的这段专注」要补上
+    /// 开启，否则要等下一次流转才有机会。
+    var onMissingCleared: (() -> Void)?
+
     init(
         runner: ProcessRunner? = nil,
         namesProvider: @escaping NamesProvider = {
@@ -517,6 +522,20 @@ final class FocusModeBridge: ObservableObject {
     /// 3. 核心勿扰兜底 —— DisplayString 写本地化显示名（实测写规范名
     ///   "Do Not Disturb" 在中文系统上运行时报「不存在名为…的专注
     ///   模式」），映射不到就原样写并靠教程提示兜底。
+    /// 勿扰的显示名：本地化映射命中用之；未覆盖语言（nl/pl 等）回退
+    /// 规范英文名 —— DisplayString 是运行时的名字解析键，中文兜底在
+    /// 非中文系统上必然「不存在名为勿扰模式的专注模式」。回退时记
+    /// 黑匣子一行，教程「导入后确认目标」就是这条路的出路。
+    nonisolated private static func resolveDoNotDisturbDisplayName(
+        preferredLanguages: [String]
+    ) -> String {
+        if let localized = localizedDoNotDisturbName(preferredLanguages: preferredLanguages) {
+            return localized
+        }
+        DebugEventLog.shared.log("联动安装：语言未覆盖本地化映射，回退英文名，导入后需确认目标模式")
+        return "Do Not Disturb"
+    }
+
     nonisolated static func readFocusTarget(
         at url: URL,
         preferredLanguages: [String] = Locale.preferredLanguages
@@ -527,7 +546,7 @@ final class FocusModeBridge: ObservableObject {
         // 一键创建永远不能死在「读不到配置」这一步。
         let fallback = FocusTarget(
             identifier: "com.apple.donotdisturb.mode.default",
-            displayName: localizedDoNotDisturbName(preferredLanguages: preferredLanguages) ?? "勿扰模式"
+            displayName: resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages)
         )
 
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -575,9 +594,10 @@ final class FocusModeBridge: ObservableObject {
             DebugEventLog.shared.log("联动安装：配置里没有勿扰模式，用静态勿扰兜底")
             return fallback
         }
-        let displayName = localizedDoNotDisturbName(preferredLanguages: preferredLanguages)
-            ?? dnd.displayName
-        return FocusTarget(identifier: dnd.identifier, displayName: displayName)
+        return FocusTarget(
+            identifier: dnd.identifier,
+            displayName: resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages)
+        )
     }
 
     /// 系统勿扰模式的本地化显示名（运行时按它匹配）。按用户首选语言
@@ -638,6 +658,7 @@ final class FocusModeBridge: ObservableObject {
         guard result == .ready, isMissing else { return }
         isMissing = false
         DebugEventLog.shared.log("联动熔断复位：检测到两条指令均已就位")
+        onMissingCleared?()
     }
 
     private func run(_ arguments: [String]) async -> (Int32, String) {

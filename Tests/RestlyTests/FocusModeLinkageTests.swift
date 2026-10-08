@@ -354,18 +354,20 @@ final class FocusModeLinkageTests: XCTestCase {
     // MARK: - 退出路径同步拉起（codex 评审 ③）
 
     @MainActor
-    func testTerminateLaunchesOffShortcutSynchronouslyOnlyWhenEngaged() {
+    func testTerminateLaunchesOffShortcutSynchronouslyOnlyWhenEngaged() async {
         let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let recorder = SyncLaunchRecorder()
         let bridge = makeBridge(runner: RunnerStub().runner, syncLaunchRecorder: recorder)
         let manager = makeManager(defaults: defaults, bridge: bridge)
+        await drain()
 
         // 没联动时退出：不该拉任何东西。
         manager.handleAppWillTerminate()
         XCTAssertEqual(recorder.argvList, [], "未联动时退出不应执行指令")
 
         manager.startFocus()
+        await drain()
         manager.handleAppWillTerminate()
         XCTAssertEqual(recorder.argvList.count, 1)
         XCTAssertEqual(
@@ -427,6 +429,60 @@ final class FocusModeLinkageTests: XCTestCase {
             .waiting(remainingSeconds: 30)
         )
         XCTAssertNil(SettingsView.installSheetPresentationState(hasOutcome: true))
+    }
+
+    /// 轮询写等待页前的取消闸：Esc 关掉又被弹回来的 bug 缺的就是它。
+    func testWaitingSheetUpdateGateHonoursCancellation() {
+        XCTAssertNil(SettingsView.waitingSheetUpdate(isCancelled: true, remainingSeconds: 12))
+        XCTAssertEqual(
+            SettingsView.waitingSheetUpdate(isCancelled: false, remainingSeconds: 12),
+            .waiting(remainingSeconds: 12)
+        )
+    }
+
+    /// ① 中途开联动碰上缺失、随后装好：本段专注要被补上开启指令，
+    /// 而不是拖到下一段（期望态/已应用态分离 + 熔断复位钩子）。
+    @MainActor
+    func testMidRunEnableWithMissingThenInstallEngagesCurrentSession() async {
+        let (defaults, suiteName) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(responses: [
+            (1, "找不到快捷指令"),                    // 中途开联动首跑失败
+            (0, ""),                                 // list 缺失 → 熔断
+            (0, "设定专注模式\n关闭专注模式\n"),       // 安装确认 → ready → 复位+钩子
+            (0, ""),                                 // 钩子触发的补执行
+            (0, ""),                                 // 停止时的关闭
+        ])
+        let settings = ReminderSettings(defaults: defaults)
+        let bridge = makeBridge(
+            runner: stub.runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式")
+        )
+        let manager = makeManager(defaults: defaults, bridge: bridge, settings: settings)
+        await drain()
+
+        manager.startFocus()
+        settings.pomodoroLinksFocusMode = true
+        await drain()
+        XCTAssertTrue(bridge.isMissing, "首跑失败 + list 缺失应熔断")
+        XCTAssertEqual(runCalls(in: stub).map(\.name), ["设定专注模式"])
+
+        // 用户装好指令：安装确认复位熔断，钩子带 manager 重跑结算。
+        bridge.onMissingCleared = { manager.syncFocusLinkage() }
+        let confirmed = await bridge.confirmInstalled()
+        XCTAssertTrue(confirmed)
+        await drain()
+
+        XCTAssertEqual(
+            runCalls(in: stub).map(\.name),
+            ["设定专注模式", "设定专注模式"],
+            "本段专注要补上开启指令"
+        )
+
+        // applied 已跟上：停止能正常执行关闭。
+        manager.stop()
+        await drain()
+        XCTAssertEqual(runCalls(in: stub).last?.name, "关闭专注模式")
     }
 
     // MARK: - 名字可配置

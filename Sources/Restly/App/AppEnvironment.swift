@@ -43,6 +43,11 @@ final class AppEnvironment: ObservableObject {
             toastManager: toastManager,
             focusModeBridge: focusModeBridge
         )
+        // 熔断在安装成功/重检就绪时复位：正在计时的这段专注要补上
+        // 开启指令，别等下一次流转。
+        focusModeBridge.onMissingCleared = { [weak pomodoroManager] in
+            pomodoroManager?.syncFocusLinkage()
+        }
 
         // ScreenStateMonitor 的回调是一次性闭包属性，订阅者不止一个之后
         // 在组合根统一接线、fan-out 给两个 manager。
