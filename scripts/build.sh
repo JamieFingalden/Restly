@@ -29,28 +29,22 @@ xcrun actool "${ASSET_CATALOG_DIR}" \
     --output-partial-info-plist "${ASSET_INFO_PATH}" \
     --warnings \
     --notices
-swift build --package-path "${PROJECT_DIR}" -c release
-BIN_DIR="$(swift build --package-path "${PROJECT_DIR}" -c release --show-bin-path)"
+swift build --package-path "${PROJECT_DIR}" -c release --arch arm64 --arch x86_64
+BIN_DIR="$(swift build --package-path "${PROJECT_DIR}" -c release --arch arm64 --arch x86_64 --show-bin-path)"
 
 rm -rf "${APP_DIR}"
 mkdir -p "${CONTENTS_DIR}/MacOS" "${CONTENTS_DIR}/Resources"
 install -m 755 "${BIN_DIR}/Restly" "${CONTENTS_DIR}/MacOS/Restly"
 install -m 644 "${PROJECT_DIR}/Support/Info.plist" "${CONTENTS_DIR}/Info.plist"
 install -m 644 "${ICON_SOURCE_PATH}" "${CONTENTS_DIR}/Resources/RestlyIcon.png"
+install -m 644 "${PROJECT_DIR}/LICENSE" "${CONTENTS_DIR}/Resources/LICENSE"
 ditto "${ASSET_OUTPUT_DIR}/" "${CONTENTS_DIR}/Resources/"
 
-SIGNING_IDENTITY="$(
-    security find-identity -v -p codesigning \
-        | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' \
-        | head -n 1
-)"
-if [[ -n "${SIGNING_IDENTITY}" ]]; then
-    codesign --force --deep --options runtime --timestamp=none --sign "${SIGNING_IDENTITY}" "${APP_DIR}"
-    echo "已使用 Apple Development 签名：${SIGNING_IDENTITY}"
-else
-    codesign --force --deep --sign - "${APP_DIR}"
-    echo "未找到 Apple Development 证书，已使用临时签名。"
-fi
+# 开源分发统一使用临时签名，不依赖构建机器上的个人开发证书。
+codesign --force --deep --sign - "${APP_DIR}"
+echo "已使用临时签名。"
 
 echo "App 构建完成：${APP_DIR}"
 zsh "${PROJECT_DIR}/scripts/create-dmg.sh"
+cd "${PROJECT_DIR}/dist"
+shasum -a 256 Restly.dmg > SHA256SUMS.txt

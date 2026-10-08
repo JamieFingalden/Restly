@@ -1,5 +1,8 @@
 # Restly
 
+[![CI](https://github.com/JamieFingalden/Restly/actions/workflows/ci.yml/badge.svg)](https://github.com/JamieFingalden/Restly/actions/workflows/ci.yml)
+[![下载](https://img.shields.io/github/v/release/JamieFingalden/Restly)](https://github.com/JamieFingalden/Restly/releases/latest)
+
 [English](README.md)
 
 Restly 是一个轻量的原生 macOS 菜单栏健康提醒工具，提醒你喝水、休息眼睛和站起来活动，还带一个专注工作用的番茄钟。
@@ -9,18 +12,25 @@ Restly 是一个轻量的原生 macOS 菜单栏健康提醒工具，提醒你喝
 ## 系统要求
 
 - macOS 13 或更高版本
+- Apple Silicon 或 Intel Mac，同一个通用安装包即可
 - App 运行不依赖 Xcode 或开发环境
-- 构建需要 Xcode Command Line Tools
+- 源码构建需要 Xcode 26.2 或更高版本，并通过 `xcode-select` 选中
 
 ## 安装和使用
 
-打开：
+1. 从[最新版本](https://github.com/JamieFingalden/Restly/releases/latest)下载 [Restly.dmg](https://github.com/JamieFingalden/Restly/releases/latest/download/Restly.dmg)。
+2. 打开 DMG，将 `Restly.app` 拖到 `Applications` 快捷方式。
+3. 从「应用程序」打开 Restly。Apple Silicon 和 Intel Mac 都使用同一个安装包。
 
-```text
-dist/Restly.dmg
+发布包使用临时签名，尚未经过 Apple 公证。如果首次打开被 macOS 拦截，先尝试打开一次，再到「系统设置 → 隐私与安全性 → 仍要打开」确认。这是 [Apple 官方提供的打开方式](https://support.apple.com/zh-cn/102445)。
+
+如需核验下载文件，可从同一个 Release 下载 `SHA256SUMS.txt`，在两个文件所在目录运行：
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
 ```
 
-将 `Restly.app` 拖到 DMG 中的 `Applications` 快捷方式。启动后 Restly 不显示 Dock 图标，入口位于屏幕右上角菜单栏的心形图标；暂停时图标会变成划掉的心形。
+启动后 Restly 不显示 Dock 图标，入口位于屏幕右上角菜单栏的心形图标；暂停时图标会变成划掉的心形。当前界面为中文，无需账号或订阅。
 
 Restly 不使用系统通知，也不会请求通知权限。喝水和站立用自绘的浮窗，护眼用覆盖所有显示器的全屏界面。
 
@@ -58,9 +68,14 @@ Restly 不使用系统通知，也不会请求通知权限。喝水和站立用�
 ```text
 dist/Restly.app
 dist/Restly.dmg
+dist/SHA256SUMS.txt
 ```
 
-App 使用 ad-hoc 本地签名，适合个人本机使用，不包含 Developer ID 或公证流程。
+构建同时包含 `arm64` 和 `x86_64` 两种架构，并统一使用临时签名。分发前校验安装包：
+
+```bash
+./scripts/verify-release.sh
+```
 
 ## 开发模式
 
@@ -96,6 +111,12 @@ RESTLY_DEVELOPMENT_MODE=1 ./dist/Restly.app/Contents/MacOS/Restly
 ```bash
 swift test
 ```
+
+## CI 与发布
+
+推送到 `main` 或提交 Pull Request 时，GitHub Actions 会分别在 Intel/macOS 15 和 Apple Silicon/macOS 26 上运行测试，再构建并校验通用 DMG。安装包保存在工作流的 Artifacts 中。
+
+发布新版本时，更新 `Support/Info.plist` 中的 `CFBundleShortVersionString` 与 `CFBundleVersion`，提交后推送匹配的标签，例如 `v0.2.0`。同一工作流会测试并打包标签对应的源码，核对标签与应用版本，全部通过后自动发布 DMG 和 SHA-256 校验和。重新运行工作流不会覆盖已发布版本的安装包。
 
 ## 参与贡献
 
