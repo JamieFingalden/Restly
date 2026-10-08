@@ -24,7 +24,17 @@ final class AppEnvironment: ObservableObject {
             overlayController: overlayController,
             screenLockManager: screenLockManager
         )
-        let focusModeBridge = FocusModeBridge()
+        // 联动快捷指令的名字跟着设置走：用户指认自己已有的指令，
+        // bridge 每次 run / 检测都现取，改完即生效。
+        let focusModeBridge = FocusModeBridge(namesProvider: { [weak settings] in
+            guard let settings else {
+                return .init(on: FocusModeBridge.defaultOnShortcutName, off: FocusModeBridge.defaultOffShortcutName)
+            }
+            return .init(
+                on: settings.resolvedFocusLinkOnName,
+                off: settings.resolvedFocusLinkOffName
+            )
+        })
         let pomodoroManager = PomodoroManager(
             settings: settings,
             toastManager: toastManager,

@@ -22,12 +22,24 @@ import Foundation
 ///   （WFActionDefinitionRegistry 的 Set Focus 注册表项），
 ///   专注模式的目标值从 `~/Library/DoNotDisturb/DB/ModeConfigurations.json`
 ///   只读解析，读不到就放弃一键创建、退到手动教程，不硬凑。
+/// - 快捷指令的名字由设置注入（namesProvider）：用户可能早已手动建过
+///   名字不同的两条指令，名字是唯一对接凭据，该由用户说了算，
+///   默认值才是「Restly 专注开启/关闭」。
 @MainActor
 final class FocusModeBridge: ObservableObject {
-    /// 快捷指令的名字就是它们的 API：生成文件、存在性检查、教程文案
-    /// 全部引用这两个常量，改名等于同时断掉三处。
-    static let onShortcutName = "Restly 专注开启"
-    static let offShortcutName = "Restly 专注关闭"
+    /// 出厂默认的快捷指令名字。只是默认值不是铁律 —— 用户可以
+    /// 在设置里指认自己已有的任意两条指令。
+    static let defaultOnShortcutName = "Restly 专注开启"
+    static let defaultOffShortcutName = "Restly 专注关闭"
+
+    /// 联动依赖的两条指令名字。名字就是它们的 API：run、存在性
+    /// 检查、生成文件名、教程文案全部由此而来。
+    struct ShortcutNames: Equatable, Sendable {
+        var on: String
+        var off: String
+    }
+
+    typealias NamesProvider = () -> ShortcutNames
 
     /// 联动执行的失败种类。missing 会触发「重新创建」引导，其余只留痕。
     enum LinkageError: Error, Equatable {
@@ -44,6 +56,14 @@ final class FocusModeBridge: ObservableObject {
         case ready
         case missing
         case unknown
+    }
+
+    /// 一键创建的结局。失败必须带原因回去给界面展示 ——
+    /// 静默降级教程曾让用户对着一个毫无动静的开关不知所措。
+    enum InstallOutcome: Equatable {
+        case opened
+        case generationFailed(String)
+        case openFailed(String)
     }
 
     /// 一键创建用的专注模式目标：reverse-DNS 的 modeIdentifier 是
@@ -66,6 +86,12 @@ final class FocusModeBridge: ObservableObject {
     /// ModeConfigurations.json（只读）。
     private let focusTargetProvider: () -> FocusTarget?
 
+    private let namesProvider: NamesProvider
+    private let openHandler: (URL) -> Bool
+    /// 两次打开之间的停顿：连开两个文件会让快捷指令 App 叠两个导入
+    /// 预览互相抢占前台，中间留一秒让用户处理完第一条。
+    private let interOpenDelay: TimeInterval
+
     private let runner: ProcessRunner
     private let workQueue = DispatchQueue(label: "com.restly.focus-mode-bridge")
 
@@ -73,24 +99,38 @@ final class FocusModeBridge: ObservableObject {
     /// 都白起一个进程毫无意义，重建成功（或下次启动）才复位。
     private(set) var isMissing = false
 
-    private var existenceCache: (result: Existence, timestamp: Date)?
+    /// 缓存连同当时的名字一起存：用户改指认名字后旧结论一律作废。
+    private var existenceCache: (names: ShortcutNames, result: Existence, timestamp: Date)?
 
     init(
         runner: ProcessRunner? = nil,
+        namesProvider: @escaping NamesProvider = {
+            ShortcutNames(on: FocusModeBridge.defaultOnShortcutName, off: FocusModeBridge.defaultOffShortcutName)
+        },
         focusTargetProvider: @escaping () -> FocusTarget? = FocusModeBridge.readFocusTargetFromSystem,
-        existenceCacheTTL: TimeInterval = 60
+        existenceCacheTTL: TimeInterval = 60,
+        openHandler: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
+        interOpenDelay: TimeInterval = 1.0
     ) {
         self.runner = runner ?? Self.defaultRunner(workQueue: workQueue)
+        self.namesProvider = namesProvider
         self.focusTargetProvider = focusTargetProvider
         self.existenceCacheTTL = existenceCacheTTL
+        self.openHandler = openHandler
+        self.interOpenDelay = interOpenDelay
     }
+
+    /// 当前生效的两条指令名字。每次现取 —— 设置里改完立刻生效，
+    /// 不需要谁记得通知 bridge。
+    var names: ShortcutNames { namesProvider() }
 
     // MARK: - 联动执行
 
     /// 执行开启/关闭快捷指令。已确认缺失时直接短路，不再起进程。
     func setFocusEngaged(_ engaged: Bool) async -> Result<Void, LinkageError> {
         guard !isMissing else { return .failure(.missing) }
-        let name = engaged ? Self.onShortcutName : Self.offShortcutName
+        let currentNames = names
+        let name = engaged ? currentNames.on : currentNames.off
         let (status, output) = await run(["run", name])
         guard status == 0 else {
             // run 失败本身不足以断言缺失（也可能是动作内部报错），
@@ -106,45 +146,80 @@ final class FocusModeBridge: ObservableObject {
         return .success(())
     }
 
-    /// 检查两条快捷指令是否都已就位。带 TTL 缓存；`forceRefresh`
-    /// 给安装确认轮询用 —— 那里要的就是绕过缓存的新答案。
+    /// 检查当前指认的两条快捷指令是否都已就位。带 TTL 缓存，且缓存
+    /// 与名字绑定 —— 改了指认名单旧结论作废；`forceRefresh` 给安装
+    /// 确认轮询用，那里要的就是绕过缓存的新答案。
     func checkShortcutsExist(forceRefresh: Bool = false) async -> Existence {
+        let currentNames = names
         if !forceRefresh, let cache = existenceCache,
+           cache.names == currentNames,
            Date().timeIntervalSince(cache.timestamp) < existenceCacheTTL {
             return cache.result
         }
 
+        guard let available = await listShortcutNames() else { return .unknown }
+        let present = Set(available)
+        let result: Existence = present.isSuperset(of: [currentNames.on, currentNames.off])
+            ? .ready
+            : .missing
+        existenceCache = (currentNames, result, Date())
+        return result
+    }
+
+    /// 一次 `shortcuts list` 的原始名单（去空白行）。nil 表示没跑成。
+    /// 设置页的「从已有快捷指令中选择」靠它给选项。
+    func listShortcutNames() async -> [String]? {
         let (status, output) = await run(["list"])
         guard status == 0 else {
             NSLog("Restly 无法列出快捷指令（\(status)）：\(output)")
-            return .unknown
+            return nil
         }
-        let names = Set(output.split(separator: "\n").map(String.init))
-        let result: Existence = names.isSuperset(of: [Self.onShortcutName, Self.offShortcutName])
-            ? .ready
-            : .missing
-        existenceCache = (result, Date())
-        return result
+        return output
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// 当前名字里哪条缺失。教程「我已创建完成」与超时文案都要点名。
+    func missingShortcutNames() async -> [String] {
+        let currentNames = names
+        guard let available = await listShortcutNames() else {
+            return [currentNames.on, currentNames.off]
+        }
+        let present = Set(available)
+        return [currentNames.on, currentNames.off].filter { !present.contains($0) }
     }
 
     // MARK: - 一键创建
 
     /// 生成两个 `.shortcut` 文件并交给系统打开（快捷指令 App 弹预览）。
-    /// 返回 false 表示连打开都没成（或生成失败），调用方退到教程路线。
+    /// 每种失败都带原因返回，由设置页映射成明确文案 —— 绝不静默吞掉。
     /// 安装是否完成由后续的 `confirmInstalled()` 有界轮询确认 ——
     /// 用户点不点「添加快捷指令」只有系统知道，这里不猜。
-    func installShortcuts() async -> Bool {
-        guard let files = try? generateShortcutFiles() else {
-            NSLog("Restly 无法生成专注模式快捷指令文件，退回手动教程。")
-            return false
+    func installShortcuts() async -> InstallOutcome {
+        let currentNames = names
+        let files: [URL]
+        do {
+            files = try generateShortcutFiles()
+        } catch {
+            NSLog("Restly 生成专注模式快捷指令文件失败：\(error.localizedDescription)")
+            return .generationFailed(error.localizedDescription)
         }
-        for file in files {
-            guard NSWorkspace.shared.open(file) else {
-                NSLog("Restly 无法打开快捷指令文件：\(file.path)")
-                return false
-            }
+        guard files.count == 2 else {
+            return .generationFailed("生成结果不完整（\(files.count) 个文件）")
         }
-        return true
+        guard openHandler(files[0]) else {
+            NSLog("Restly 无法打开快捷指令文件：\(files[0].path)")
+            return .openFailed("无法打开「\(currentNames.on).shortcut」")
+        }
+        if interOpenDelay > 0 {
+            try? await Task.sleep(for: .seconds(interOpenDelay))
+        }
+        guard openHandler(files[1]) else {
+            NSLog("Restly 无法打开快捷指令文件：\(files[1].path)")
+            return .openFailed("无法打开「\(currentNames.off).shortcut」")
+        }
+        return .opened
     }
 
     /// 安装确认：清掉缓存与缺失标记后重新检查。轮询里检测到就绪即停。
@@ -168,8 +243,9 @@ final class FocusModeBridge: ObservableObject {
             .appendingPathComponent("RestlyFocusShortcuts-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let onURL = directory.appendingPathComponent("\(Self.onShortcutName).shortcut")
-        let offURL = directory.appendingPathComponent("\(Self.offShortcutName).shortcut")
+        let currentNames = names
+        let onURL = directory.appendingPathComponent("\(currentNames.on).shortcut")
+        let offURL = directory.appendingPathComponent("\(currentNames.off).shortcut")
         try writeWorkflow(Self.makeWorkflow(enable: true, target: target), to: onURL)
         try writeWorkflow(Self.makeWorkflow(enable: false, target: target), to: offURL)
         return [onURL, offURL]
@@ -290,7 +366,8 @@ final class FocusModeBridge: ObservableObject {
 
     private func markMissing() {
         isMissing = true
-        NSLog("Restly 未检测到专注模式快捷指令，联动停止重试，直到重新创建。")
+        let currentNames = names
+        NSLog("Restly 未检测到快捷指令「\(currentNames.on)」「\(currentNames.off)」，联动停止重试，直到重新创建。")
     }
 
     private func run(_ arguments: [String]) async -> (Int32, String) {

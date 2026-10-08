@@ -49,12 +49,24 @@ final class FocusModeLinkageTests: XCTestCase {
     @MainActor
     private func makeBridge(
         runner: @escaping FocusModeBridge.ProcessRunner,
+        names: FocusModeBridge.ShortcutNames = .init(
+            on: FocusModeBridge.defaultOnShortcutName,
+            off: FocusModeBridge.defaultOffShortcutName
+        ),
         target: FocusModeBridge.FocusTarget? = FocusModeBridge.FocusTarget(
             identifier: "com.apple.donotdisturb.mode.default",
             displayName: "Do Not Disturb"
-        )
+        ),
+        openHandler: @escaping (URL) -> Bool = { _ in true },
+        interOpenDelay: TimeInterval = 0
     ) -> FocusModeBridge {
-        FocusModeBridge(runner: runner, focusTargetProvider: { target })
+        FocusModeBridge(
+            runner: runner,
+            namesProvider: { names },
+            focusTargetProvider: { target },
+            openHandler: openHandler,
+            interOpenDelay: interOpenDelay
+        )
     }
 
     @MainActor
@@ -250,6 +262,115 @@ final class FocusModeLinkageTests: XCTestCase {
 
         XCTAssertEqual(stub.invocations.count, 2)
         XCTAssertTrue(manager.hasShownFocusLinkageWarning)
+    }
+
+    // MARK: - 名字可配置
+
+    /// 用户手动建的指令（名字与出厂默认不同）按名字指认后必须能被
+    /// 识别并直接执行 —— 这正是 P0-C 要打通的场景。
+    @MainActor
+    func testConfiguredNamesDriveRunAndDetection() async {
+        let stub = RunnerStub(responses: [
+            (0, ""),                              // run 开启
+            (0, "设定专注模式\n关闭专注模式\n别的指令\n"),  // list
+        ])
+        let bridge = makeBridge(
+            runner: stub.runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式")
+        )
+
+        let runResult = await bridge.setFocusEngaged(true)
+        guard case .success = runResult else {
+            return XCTFail("指认的名字应当被用于 run，实际 \(runResult)")
+        }
+        XCTAssertEqual(stub.invocations.first?.name, "设定专注模式")
+
+        let existence = await bridge.checkShortcutsExist()
+        XCTAssertEqual(existence, .ready, "按名字指认的已有指令应识别为就绪")
+    }
+
+    @MainActor
+    func testPartialNameMatchReportsMissingAndNamesTheGap() async {
+        let stub = RunnerStub(responses: [
+            (0, "设定专注模式\n别的指令\n"),   // list：只有开启那条
+            (0, "设定专注模式\n别的指令\n"),   // missingNames 复核时再 list 一次
+        ])
+        let bridge = makeBridge(
+            runner: stub.runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式")
+        )
+
+        let existence = await bridge.checkShortcutsExist()
+        XCTAssertEqual(existence, .missing)
+        let missing = await bridge.missingShortcutNames()
+        XCTAssertEqual(missing, ["关闭专注模式"], "要点名缺的是哪条")
+    }
+
+    @MainActor
+    func testExistenceCacheInvalidatesWhenNamesChange() async {
+        var names = FocusModeBridge.ShortcutNames(on: "A", off: "B")
+        let stub = RunnerStub(responses: [
+            (0, "A\nB\n"),                       // 第一次 list：ready
+            (0, "设定专注模式\n别的指令\n"),      // 改名后的 list：missing
+        ])
+        let bridge = FocusModeBridge(runner: stub.runner, namesProvider: { names })
+
+        _ = await bridge.checkShortcutsExist()
+        names = .init(on: "设定专注模式", off: "关闭专注模式")
+        let afterRename = await bridge.checkShortcutsExist()
+
+        XCTAssertEqual(afterRename, .missing, "改了指认名字后旧缓存结论必须作废")
+        XCTAssertEqual(stub.invocations.filter { $0.command == "list" }.count, 2)
+    }
+
+    // MARK: - 一键创建的结局必须可见
+
+    @MainActor
+    func testInstallOpensBothFilesInOrderAndReportsOpened() async {
+        var opened: [String] = []
+        var removed: Set<String> = []
+        let bridge = makeBridge(
+            runner: RunnerStub().runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式"),
+            openHandler: { url in
+                opened.append(url.lastPathComponent)
+                removed.insert(url.lastPathComponent)
+                return true
+            }
+        )
+
+        let outcome = await bridge.installShortcuts()
+
+        XCTAssertEqual(outcome, .opened)
+        XCTAssertEqual(opened, ["设定专注模式.shortcut", "关闭专注模式.shortcut"], "两次打开的顺序就是开启、关闭")
+    }
+
+    @MainActor
+    func testInstallReportsGenerationFailureWithReason() async {
+        let bridge = makeBridge(runner: RunnerStub().runner, target: nil)
+
+        let outcome = await bridge.installShortcuts()
+
+        guard case .generationFailed(let reason) = outcome else {
+            return XCTFail("读不到专注模式目标应报 generationFailed，实际 \(outcome)")
+        }
+        XCTAssertFalse(reason.isEmpty, "失败原因要能拿去给用户看")
+    }
+
+    @MainActor
+    func testInstallReportsOpenFailureWithShortcutName() async {
+        let bridge = makeBridge(
+            runner: RunnerStub().runner,
+            names: .init(on: "设定专注模式", off: "关闭专注模式"),
+            openHandler: { _ in false }
+        )
+
+        let outcome = await bridge.installShortcuts()
+
+        guard case .openFailed(let reason) = outcome else {
+            return XCTFail("打不开文件应报 openFailed，实际 \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("设定专注模式"), "失败文案要点名哪条没打开")
     }
 
     // MARK: - FocusModeBridge 本体

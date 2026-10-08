@@ -9,12 +9,17 @@ struct SettingsView: View {
 
     // MARK: 专注模式联动的界面状态
     // 安装是否完成、快捷指令是否就位都只有系统能回答，视图只存结论。
-    @State private var linkageStatus = FocusModeBridge.Existence.unknown
+    // nil = 还没查过（检测中）；失败一律落到 installSheet / linkageStatus，
+    // 不再有任何静默路径 —— 开关弹回又毫无提示曾让用户以为功能是坏的。
+    @State private var linkageStatus: FocusModeBridge.Existence?
+    @State private var isCheckingLinkage = false
     @State private var showCreationChoice = false
-    @State private var isInstalling = false
-    @State private var installTimedOut = false
+    @State private var installSheet: FocusLinkageInstallSheetState?
     @State private var showTutorial = false
     @State private var installTask: Task<Void, Never>?
+    /// 「从已有快捷指令中选择」的选项名单，一次 list 缓存着用。
+    @State private var availableShortcutNames: [String]?
+    @State private var isLoadingShortcutNames = false
 
     var body: some View {
         ZStack {
@@ -33,24 +38,53 @@ struct SettingsView: View {
             refreshLinkageStatusIfEnabled()
         }
         .confirmationDialog(
-            "是否一键创建快捷指令？",
+            "快捷指令还没就绪",
             isPresented: $showCreationChoice,
             titleVisibility: .visible
         ) {
             Button("一键创建") { runAutomaticInstall() }
             Button("手动创建") { showTutorial = true }
-            Button("取消", role: .cancel) {}
+            Button("取消并关闭联动", role: .destructive) {
+                // 取消是唯一把开关拨回去的路径：联动开着而指令不存在，
+                // 只会让每个专注流转都白跑进程。
+                settings.pomodoroLinksFocusMode = false
+            }
         } message: {
-            Text("Restly 将生成「Restly 专注开启」「Restly 专注关闭」两条快捷指令，请在快捷指令 App 中各点一次「添加快捷指令」。")
+            Text("可以把已有的快捷指令指认给 Restly（下方改名字即可），也可以现在创建。取消将关闭联动。")
         }
-        .sheet(isPresented: $isInstalling) {
-            FocusLinkageInstallingView(onCancel: cancelInstall)
+        .sheet(
+            isPresented: Binding(
+                get: { installSheet != nil },
+                set: { if !$0 { installSheet = nil } }
+            )
+        ) {
+            FocusLinkageInstallingView(
+                state: installSheet ?? .waiting(remainingSeconds: 0),
+                onName: settings.resolvedFocusLinkOnName,
+                offName: settings.resolvedFocusLinkOffName
+            ) { state in
+                installSheet = state
+            } onCancel: {
+                installTask?.cancel()
+                installTask = nil
+                installSheet = nil
+            } onRetry: {
+                installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
+                runAutomaticInstall()
+            } onShowTutorial: {
+                installSheet = nil
+                showTutorial = true
+            }
         }
         .sheet(isPresented: $showTutorial) {
             FocusLinkageTutorialView(
+                onName: settings.resolvedFocusLinkOnName,
+                offName: settings.resolvedFocusLinkOffName,
+                check: { await focusModeBridge.checkShortcutsExist(forceRefresh: true) },
+                missingNames: { await focusModeBridge.missingShortcutNames() },
                 onFinished: {
                     showTutorial = false
-                    refreshLinkageStatusIfEnabled(force: true)
+                    Task { await refreshLinkageStatus(force: true) }
                 }
             )
         }
@@ -58,47 +92,51 @@ struct SettingsView: View {
 
     // MARK: - 专注模式联动
 
+    /// 拨 ON 一律先置位（乐观开启）：开关立即生效，是否就绪交给
+    /// footer 的状态展示。以前「检测通过才写 true」曾让开关当场弹回，
+    /// 用户只当是功能坏了。创建引导只是引导，不是门。
     private var linkageToggleBinding: Binding<Bool> {
         Binding(
             get: { settings.pomodoroLinksFocusMode },
             set: { turnOn in
-                guard turnOn else {
-                    // 直接关：PomodoroManager 的联动同步会立刻执行关闭指令
-                    // 恢复原状（若此刻专注模式还开着）。
-                    settings.pomodoroLinksFocusMode = false
-                    return
-                }
-                // 先静默确认：两条快捷指令都在就直接开启，不打扰。
-                Task {
-                    let existence = await focusModeBridge.checkShortcutsExist()
-                    if existence == .ready {
-                        linkageStatus = .ready
-                        settings.pomodoroLinksFocusMode = true
-                    } else {
-                        linkageStatus = existence
-                        showCreationChoice = true
-                    }
-                }
+                settings.pomodoroLinksFocusMode = turnOn
+                guard turnOn else { return }
+                // PomodoroManager 的联动同步已随置位生效；这里只负责
+                // 把「就绪没有」查出来摆到台面上，缺指令就顺势引导 ——
+                // 引导是门厅不是门禁，用户关掉对话框联动照样开着。
+                Task { await refreshLinkageStatus(autoGuideOnMissing: true) }
             }
         )
     }
 
-    /// 开关行常驻的状态副标题：就绪给确认，缺失给可点的重建入口。
+    /// 开关行常驻的状态副标题：只要开关开着就显示真实状态 ——
+    /// 检测中 / 已就绪 / 未检测到（点名 + 可点的重建入口）。
+    /// 曾把失败分支藏在设置值后面，失败时反而什么都不显示。
     @ViewBuilder
     private var linkageStatusFooter: some View {
         if settings.pomodoroLinksFocusMode {
-            switch linkageStatus {
-            case .ready:
+            if isCheckingLinkage || linkageStatus == nil {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Label("正在检测快捷指令…", systemImage: "magnifyingglass")
+                        .font(.system(size: 12, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+            } else if linkageStatus == .ready {
                 Label("快捷指令已就绪，专注计时将自动开关专注模式。", systemImage: "checkmark.seal.fill")
                     .font(.system(size: 12, design: .rounded))
                     .foregroundStyle(.green.opacity(0.85))
-            case .missing, .unknown:
+            } else {
                 Button {
                     showCreationChoice = true
                 } label: {
-                    Label("未检测到快捷指令，点击重新走创建流程。", systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 12, design: .rounded))
-                        .foregroundStyle(.orange)
+                    Label(
+                        "未检测到「\(settings.resolvedFocusLinkOnName)」「\(settings.resolvedFocusLinkOffName)」，点击重新走创建流程。",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundStyle(.orange)
                 }
                 .buttonStyle(.plain)
             }
@@ -112,47 +150,141 @@ struct SettingsView: View {
         }
     }
 
-    private func refreshLinkageStatusIfEnabled(force: Bool = false) {
-        guard settings.pomodoroLinksFocusMode else { return }
-        Task {
-            linkageStatus = await focusModeBridge.checkShortcutsExist(forceRefresh: force)
+    /// 名字指认区：允许手输，也能从一次 `shortcuts list` 的结果里选。
+    /// 只有开关开着（或正要引导创建）才值得花这一个进程去拿名单。
+    @ViewBuilder
+    private var linkageNameRows: some View {
+        if settings.pomodoroLinksFocusMode {
+            VStack(alignment: .leading, spacing: 6) {
+                shortcutNameRow(
+                    title: "开启指令",
+                    placeholder: FocusModeBridge.defaultOnShortcutName,
+                    binding: Binding(
+                        get: { settings.focusLinkOnShortcutName },
+                        set: { settings.focusLinkOnShortcutName = $0 }
+                    )
+                )
+                shortcutNameRow(
+                    title: "关闭指令",
+                    placeholder: FocusModeBridge.defaultOffShortcutName,
+                    binding: Binding(
+                        get: { settings.focusLinkOffShortcutName },
+                        set: { settings.focusLinkOffShortcutName = $0 }
+                    )
+                )
+                HStack(spacing: 6) {
+                    Button("从已有快捷指令中选择") { loadAvailableShortcutNames(force: false) }
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                    if isLoadingShortcutNames {
+                        ProgressView().controlSize(.mini)
+                    }
+                    Spacer()
+                    Text("名字需与快捷指令 App 中完全一致")
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundStyle(.tertiary)
+                }
+            }
         }
     }
 
+    private func shortcutNameRow(
+        title: String,
+        placeholder: String,
+        binding: Binding<String>
+    ) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .frame(width: 60, alignment: .leading)
+            TextField(placeholder, text: binding)
+                .textFieldStyle(.roundedBorder)
+            Menu {
+                if let availableShortcutNames {
+                    ForEach(availableShortcutNames, id: \.self) { name in
+                        Button(name) { binding.wrappedValue = name }
+                    }
+                } else {
+                    Button("先加载列表") { loadAvailableShortcutNames(force: false) }
+                }
+                Divider()
+                Button("刷新列表") { loadAvailableShortcutNames(force: true) }
+            } label: {
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .font(.system(size: 12.5, design: .rounded))
+        .onSubmit { Task { await refreshLinkageStatus() } }
+    }
+
+    private func loadAvailableShortcutNames(force: Bool) {
+        guard !isLoadingShortcutNames else { return }
+        if !force, availableShortcutNames != nil { return }
+        isLoadingShortcutNames = true
+        Task {
+            availableShortcutNames = await focusModeBridge.listShortcutNames()
+            isLoadingShortcutNames = false
+        }
+    }
+
+    private func refreshLinkageStatus(force: Bool = false, autoGuideOnMissing: Bool = false) async {
+        guard settings.pomodoroLinksFocusMode else { return }
+        guard !isCheckingLinkage else { return }
+        isCheckingLinkage = true
+        let existence = await focusModeBridge.checkShortcutsExist(forceRefresh: force)
+        linkageStatus = existence
+        isCheckingLinkage = false
+        if autoGuideOnMissing, existence != .ready {
+            showCreationChoice = true
+        }
+    }
+
+    private func refreshLinkageStatusIfEnabled(force: Bool = false) {
+        Task { await refreshLinkageStatus(force: force) }
+    }
+
+    /// 安装确认轮询的总量与节奏（15 次 × 2 秒 = 30 秒），超时即止。
+    private static let installTotalSeconds = 30
+    private static let installPollInterval: TimeInterval = 2
+
     /// 一键创建：生成文件并交给快捷指令 App，随后有界轮询等用户
-    /// 点完「添加快捷指令」。检测到就绪即停；超时不重试、不循环，
-    /// 降级成「未检测到」并给出手动教程。
+    /// 点完「添加快捷指令」。生成/打开失败带原因进 sheet，绝不静默。
     private func runAutomaticInstall() {
-        installTimedOut = false
-        isInstalling = true
+        installTask?.cancel()
+        installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
         installTask = Task {
-            let opened = await focusModeBridge.installShortcuts()
-            guard opened else {
-                isInstalling = false
-                showTutorial = true
+            let outcome = await focusModeBridge.installShortcuts()
+            if Task.isCancelled { return }
+            switch outcome {
+            case .opened:
+                break
+            case .generationFailed(let reason):
+                installSheet = .generationFailed(reason)
+                linkageStatus = .missing
+                return
+            case .openFailed(let reason):
+                installSheet = .openFailed(reason)
+                linkageStatus = .missing
                 return
             }
-            for _ in 0..<15 {
-                try? await Task.sleep(for: .seconds(2))
+
+            var elapsed = 0
+            while elapsed < Self.installTotalSeconds {
+                let remaining = max(0, Self.installTotalSeconds - elapsed)
+                installSheet = .waiting(remainingSeconds: remaining)
+                try? await Task.sleep(for: .seconds(Self.installPollInterval))
                 if Task.isCancelled { return }
+                elapsed += Int(Self.installPollInterval)
                 if await focusModeBridge.confirmInstalled() {
                     linkageStatus = .ready
-                    isInstalling = false
-                    settings.pomodoroLinksFocusMode = true
+                    installSheet = nil
                     return
                 }
             }
+            installSheet = .timedOut
             linkageStatus = .missing
-            installTimedOut = true
-            isInstalling = false
         }
-    }
-
-    private func cancelInstall() {
-        installTask?.cancel()
-        installTask = nil
-        isInstalling = false
-        linkageStatus = .missing
     }
 
     private var header: some View {
@@ -396,12 +528,7 @@ struct SettingsView: View {
                     SettingsDivider()
                     Toggle("与 macOS 专注模式联动", isOn: linkageToggleBinding)
                     linkageStatusFooter
-                    if installTimedOut && !settings.pomodoroLinksFocusMode {
-                        Button("一键创建没有等到确认，改用手动创建教程") {
-                            showTutorial = true
-                        }
-                        .font(.system(size: 12, design: .rounded))
-                    }
+                    linkageNameRows
                     SettingsDivider()
                     Label(
                         settings.pomodoroAutoStartBreak
@@ -585,40 +712,120 @@ private struct SettingsDivider: View {
     }
 }
 
-/// 一键创建的等待页。生成的文件已经交给快捷指令 App，剩下的只有
-/// 用户点「添加快捷指令」—— 这里只负责把这件事说清楚，轮询由
-/// SettingsView 有界进行，等不到就降级，不无限等。
+/// 一键创建 sheet 的几种面貌：等待（带剩余秒数）、超时点名、
+/// 生成失败、打开失败。每种失败都带原因与出路，不再静默跳教程。
+enum FocusLinkageInstallSheetState: Equatable {
+    case waiting(remainingSeconds: Int)
+    case timedOut
+    case generationFailed(String)
+    case openFailed(String)
+}
+
+/// 一键创建页。等待阶段只做一件事：说清楚接下来要去快捷指令 App
+/// 点什么；任何失败都把原因和出路摆在同一屏里。
 private struct FocusLinkageInstallingView: View {
+    let state: FocusLinkageInstallSheetState
+    let onName: String
+    let offName: String
+    let onStateChange: (FocusLinkageInstallSheetState) -> Void
     let onCancel: () -> Void
+    let onRetry: () -> Void
+    let onShowTutorial: () -> Void
 
     var body: some View {
         VStack(spacing: 18) {
-            ProgressView()
-                .controlSize(.large)
-
-            VStack(spacing: 6) {
-                Text("正在等待快捷指令确认")
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
-                Text("请在快捷指令 App 中，为「Restly 专注开启」「Restly 专注关闭」各点一次「添加快捷指令」。")
-                    .font(.system(size: 12, design: .rounded))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
+            switch state {
+            case .waiting(let remainingSeconds):
+                waitingContent(remainingSeconds: remainingSeconds)
+            case .timedOut:
+                failedContent(
+                    icon: "hourglass",
+                    title: "没有等到快捷指令确认",
+                    detail: "未检测到名字完全为「\(onName)」「\(offName)」的快捷指令。\n请确认已在快捷指令 App 中各点过「添加快捷指令」，或核对名字是否一致。"
+                )
+            case .generationFailed(let reason):
+                failedContent(
+                    icon: "xmark.octagon",
+                    title: "生成快捷指令文件失败",
+                    detail: reason
+                )
+            case .openFailed(let reason):
+                failedContent(
+                    icon: "xmark.octagon",
+                    title: "无法交给快捷指令 App",
+                    detail: reason
+                )
             }
-            .frame(maxWidth: 300)
-
-            Button("取消") { onCancel() }
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
         }
         .padding(28)
-        .frame(width: 380)
+        .frame(width: 400)
+    }
+
+    @ViewBuilder
+    private func waitingContent(remainingSeconds: Int) -> some View {
+        ProgressView()
+            .controlSize(.large)
+
+        VStack(spacing: 6) {
+            Text("正在等待快捷指令确认（约 \(remainingSeconds) 秒）")
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+            Text("请在快捷指令 App 中，为「\(onName)」「\(offName)」各点一次「添加快捷指令」。")
+                .font(.system(size: 12, design: .rounded))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: 320)
+
+        Button("取消") { onCancel() }
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+    }
+
+    @ViewBuilder
+    private func failedContent(icon: String, title: String, detail: String) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 28, weight: .semibold))
+            .foregroundStyle(.orange)
+
+        VStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+            Text(detail)
+                .font(.system(size: 12, design: .rounded))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: 320)
+
+        HStack(spacing: 10) {
+            Button("重试") { onRetry() }
+                .buttonStyle(.borderedProminent)
+            Button("看手动教程") { onShowTutorial() }
+            Button("完成") { onCancel() }
+        }
+        .font(.system(size: 12, weight: .semibold, design: .rounded))
+        .controlSize(.regular)
     }
 }
 
 /// 手动创建教程。名字是 Restly 调用快捷指令的唯一凭据，
-/// 所以这里反复强调一字不差。
+/// 所以期望名字给成可复制的文本，创建完当场复核并回显结论。
 private struct FocusLinkageTutorialView: View {
+    let onName: String
+    let offName: String
+    let check: () async -> FocusModeBridge.Existence
+    let missingNames: () async -> [String]
     let onFinished: () -> Void
+
+    private enum CheckResult: Equatable {
+        case checking
+        case ready
+        case missing([String])
+        case unknown
+    }
+
+    @State private var result: CheckResult?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -639,13 +846,18 @@ private struct FocusLinkageTutorialView: View {
                 tutorialStep(
                     index: 2,
                     title: "添加「设置专注模式」动作，选「打开」",
-                    detail: "然后把快捷指令命名为「Restly 专注开启」。"
+                    detail: "然后把快捷指令命名为下方第一条名字。"
                 )
                 tutorialStep(
                     index: 3,
                     title: "再新建一条，动作选「关闭」",
-                    detail: "命名为「Restly 专注关闭」。"
+                    detail: "命名为下方第二条名字。"
                 )
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                copyableNameRow(label: "开启指令", name: onName)
+                copyableNameRow(label: "关闭指令", name: offName)
             }
 
             Label(
@@ -656,6 +868,8 @@ private struct FocusLinkageTutorialView: View {
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
 
+            checkResultFooter
+
             HStack {
                 Button("打开快捷指令.app") {
                     let url = URL(fileURLWithPath: "/System/Applications/Shortcuts.app")
@@ -664,12 +878,78 @@ private struct FocusLinkageTutorialView: View {
                     }
                 }
                 Spacer()
+                Button("我已创建完成") { Task { await verifyCreation() } }
                 Button("完成") { onFinished() }
                     .keyboardShortcut(.defaultAction)
             }
         }
         .padding(24)
-        .frame(width: 420)
+        .frame(width: 440)
+    }
+
+    /// 期望名字做成可复制：手输名字错一个字就永远检测不到。
+    private func copyableNameRow(label: String, name: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            Text(name)
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(name, forType: .string)
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.borderless)
+            .help("复制名字")
+        }
+    }
+
+    @ViewBuilder
+    private var checkResultFooter: some View {
+        switch result {
+        case .checking:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("正在检测…")
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+        case .ready:
+            Label("已检测到两条快捷指令，联动就绪。", systemImage: "checkmark.seal.fill")
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(.green.opacity(0.9))
+        case .missing(let names):
+            Label(
+                "仍未检测到「\(names.joined(separator: "」「"))」。请核对名字，或在设置里改用「从已有快捷指令中选择」指认你现有的指令。",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.system(size: 12, design: .rounded))
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        case .unknown:
+            Label("暂时无法读取快捷指令列表，请稍后再试。", systemImage: "questionmark.circle")
+                .font(.system(size: 12, design: .rounded))
+                .foregroundStyle(.secondary)
+        case nil:
+            EmptyView()
+        }
+    }
+
+    private func verifyCreation() async {
+        result = .checking
+        let existence = await check()
+        switch existence {
+        case .ready:
+            result = .ready
+        case .missing:
+            result = .missing(await missingNames())
+        case .unknown:
+            result = .unknown
+        }
     }
 
     private func tutorialStep(index: Int, title: String, detail: String) -> some View {

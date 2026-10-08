@@ -127,8 +127,33 @@ final class ReminderSettingsTests: XCTestCase {
         settings.pomodoroAutoStartFocus = true
         settings.pomodoroShowsInMenuBar = false
         settings.pomodoroLinksFocusMode = true
+        settings.focusLinkOnShortcutName = "设定专注模式"
+        settings.focusLinkOffShortcutName = "关闭专注模式"
 
-        XCTAssertEqual(changes, Array(repeating: .other, count: 8))
+        XCTAssertEqual(changes, Array(repeating: .other, count: 10))
+    }
+
+    /// 联动指令名字：出厂默认两条常量名，用户指认后持久化；
+    /// 清空/纯空白回退默认 —— 输入框清空不该让联动去找空名字。
+    @MainActor
+    func testFocusLinkShortcutNamesDefaultPersistAndFallBack() {
+        let (settings, suiteName, defaults) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(settings.focusLinkOnShortcutName, FocusModeBridge.defaultOnShortcutName)
+        XCTAssertEqual(settings.focusLinkOffShortcutName, FocusModeBridge.defaultOffShortcutName)
+        XCTAssertEqual(settings.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
+        XCTAssertEqual(settings.resolvedFocusLinkOffName, FocusModeBridge.defaultOffShortcutName)
+
+        settings.focusLinkOnShortcutName = "  设定专注模式  "
+        settings.focusLinkOffShortcutName = "关闭专注模式"
+
+        let reloaded = ReminderSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.resolvedFocusLinkOnName, "设定专注模式")
+        XCTAssertEqual(reloaded.resolvedFocusLinkOffName, "关闭专注模式")
+
+        reloaded.focusLinkOnShortcutName = "   "
+        XCTAssertEqual(reloaded.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
     }
 
     /// 联动开关的翻转走独立回调（PomodoroManager 靠它立刻执行
