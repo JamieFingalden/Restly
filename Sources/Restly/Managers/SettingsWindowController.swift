@@ -6,16 +6,19 @@ final class SettingsWindowController: NSObject {
     private let settings: ReminderSettings
     private let manager: ReminderManager
     private let launchAtLoginManager: LaunchAtLoginManager
+    private let focusModeBridge: FocusModeBridge
     private var windowController: NSWindowController?
 
     init(
         settings: ReminderSettings,
         manager: ReminderManager,
-        launchAtLoginManager: LaunchAtLoginManager
+        launchAtLoginManager: LaunchAtLoginManager,
+        focusModeBridge: FocusModeBridge
     ) {
         self.settings = settings
         self.manager = manager
         self.launchAtLoginManager = launchAtLoginManager
+        self.focusModeBridge = focusModeBridge
     }
 
     @objc func show() {
@@ -44,7 +47,8 @@ final class SettingsWindowController: NSObject {
             rootView: SettingsView(
                 settings: settings,
                 manager: manager,
-                launchAtLoginManager: launchAtLoginManager
+                launchAtLoginManager: launchAtLoginManager,
+                focusModeBridge: focusModeBridge
             )
         )
 

@@ -90,7 +90,23 @@ final class ReminderSettings: ObservableObject {
         didSet { persist(pomodoroShowsInMenuBar, forKey: Keys.pomodoroShowsInMenuBar, change: .other) }
     }
 
+    /// 与 macOS 专注模式联动。默认关闭 —— 依赖用户自己装的两条快捷指令，
+    /// 没装就打开只会让 PomodoroManager 每次转段都白跑进程。
+    @Published var pomodoroLinksFocusMode: Bool {
+        didSet {
+            persist(pomodoroLinksFocusMode, forKey: Keys.pomodoroLinksFocusMode, change: .other)
+            // 联动开关翻转要立刻反映到专注模式上（中途关掉得恢复原状）。
+            // 走独立回调而不挤进 onChange：那是单槽属性、已由
+            // ReminderManager 占用，为这一个开关改成广播数组不值得。
+            guard !isLoading else { return }
+            onLinksFocusModeChange?()
+        }
+    }
+
     var onChange: ((SettingsChange) -> Void)?
+
+    /// 联动开关翻转的通知，由 PomodoroManager 接线（组合根风格，同 onChange）。
+    var onLinksFocusModeChange: (() -> Void)?
 
     private let defaults: UserDefaults
     private var isLoading = true
@@ -114,6 +130,7 @@ final class ReminderSettings: ObservableObject {
         pomodoroAutoStartBreak = defaults.object(forKey: Keys.pomodoroAutoStartBreak) as? Bool ?? true
         pomodoroAutoStartFocus = defaults.object(forKey: Keys.pomodoroAutoStartFocus) as? Bool ?? false
         pomodoroShowsInMenuBar = defaults.object(forKey: Keys.pomodoroShowsInMenuBar) as? Bool ?? true
+        pomodoroLinksFocusMode = defaults.object(forKey: Keys.pomodoroLinksFocusMode) as? Bool ?? false
         isLoading = false
     }
 
@@ -157,5 +174,6 @@ final class ReminderSettings: ObservableObject {
         static let pomodoroAutoStartBreak = "pomodoroAutoStartBreak"
         static let pomodoroAutoStartFocus = "pomodoroAutoStartFocus"
         static let pomodoroShowsInMenuBar = "pomodoroShowsInMenuBar"
+        static let pomodoroLinksFocusMode = "pomodoroLinksFocusMode"
     }
 }

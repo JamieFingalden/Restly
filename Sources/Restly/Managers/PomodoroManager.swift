@@ -1,11 +1,17 @@
+import AppKit
 import Foundation
 
 /// 番茄钟的编排层。`PomodoroSession` 管状态怎么变，这里管定时器、
-/// Toast、持久化和锁屏 —— 模型保持纯净，副作用全部收在这里。
+/// Toast、持久化、锁屏和专注模式联动 —— 模型保持纯净，副作用全部收在这里。
 ///
 /// 与健康提醒刻意互不干扰：全局暂停提醒不影响番茄钟（番茄钟由用户
 /// 显式驱动），锁屏冻结也各自独立处理。番茄钟的暂停/跳过/停止只在
 /// 本 manager 里生效。
+///
+/// 专注模式联动是纯边沿触发：所有状态流转最后都汇到
+/// `syncFocusLinkage()`，按「设置开 && 专注段计时中」现算应当联动的
+/// 值，与上次比较，变了才让 `FocusModeBridge` 跑快捷指令 —— 没有那
+/// 条 diff 线，每个流转点都得各自记得开或关，迟早漏一个。
 @MainActor
 final class PomodoroManager: ObservableObject {
     /// 只在阶段或状态变化时发布；倒计时文本由视图层 TimelineView 每秒现算，
@@ -27,6 +33,17 @@ final class PomodoroManager: ObservableObject {
     private let toastManager: ToastManager
     private let runtimeConfiguration: RuntimeConfiguration
     private let defaults: UserDefaults
+    private let focusModeBridge: FocusModeBridge
+
+    /// 「重新创建」按钮要打开设置页，manager 不持有窗口层，
+    /// 由组合根塞一个跳转闭包进来。
+    var onRequestOpenSettings: (() -> Void)?
+
+    /// 上一次联动输出值。边沿触发的参照物 —— 进程重启从「未联动」起步，
+    /// 存档恢复出的计时中专注会重新开启联动，与用户预期一致。
+    private var isFocusLinkEngaged = false
+    /// 缺失提醒每次启动最多一条：连打几颗番茄都失败时，第 2 条起就是噪音。
+    private(set) var hasShownFocusLinkageWarning = false
 
     /// 只有一个一次性定时器，直接定到当前段的结束时刻。
     private var timer: Timer?
@@ -46,12 +63,14 @@ final class PomodoroManager: ObservableObject {
         toastManager: ToastManager,
         runtimeConfiguration: RuntimeConfiguration = .current,
         defaults: UserDefaults = .standard,
+        focusModeBridge: FocusModeBridge = FocusModeBridge(),
         now: Date = Date()
     ) {
         self.settings = settings
         self.toastManager = toastManager
         self.runtimeConfiguration = runtimeConfiguration
         self.defaults = defaults
+        self.focusModeBridge = focusModeBridge
 
         var restored = PomodoroSession(
             snapshot: Self.readSnapshot(from: defaults, now: now)
@@ -62,6 +81,39 @@ final class PomodoroManager: ObservableObject {
         persistSession()
         rescheduleTimer(now: now)
         updateMenuBarDisplay()
+
+        // 联动开关在设置里翻转时，这里要立刻跟着执行开启/关闭 ——
+        // 中途关掉而联动正开着，必须马上恢复原状，不能等下一次流转。
+        settings.onLinksFocusModeChange = { [weak self] in
+            self?.syncFocusLinkage()
+        }
+        // 重启恢复出计时中的专注也算一次流转：重启前联动开着，
+        // 新进程从「未联动」起步，这里自然补上开启指令。
+        syncFocusLinkage()
+
+        // 退出时把专注模式恢复原状：session 本就跨重启续跑，
+        // 下次启动恢复成 running focus 后会重新联动。
+        terminateObserverBox.token = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleAppWillTerminate() }
+        }
+    }
+
+    /// 观察者令牌装进 Sendable 盒子，deinit 才能从非隔离上下文取到它
+    /// 去反注册（盒子只在 init 写一次，之后只读）。
+    private final class TerminateObserverBox: @unchecked Sendable {
+        var token: NSObjectProtocol?
+    }
+
+    private let terminateObserverBox = TerminateObserverBox()
+
+    deinit {
+        if let token = terminateObserverBox.token {
+            NotificationCenter.default.removeObserver(token)
+        }
     }
 
     // MARK: - 对外查询
@@ -106,6 +158,7 @@ final class PomodoroManager: ObservableObject {
         timer?.invalidate()
         timer = nil
         updateMenuBarDisplay()
+        syncFocusLinkage()
     }
 
     func resume() {
@@ -114,6 +167,7 @@ final class PomodoroManager: ObservableObject {
         persistSession()
         rescheduleTimer()
         updateMenuBarDisplay()
+        syncFocusLinkage()
     }
 
     /// 跳过当前段或就绪态里等着的下一段。不弹 Toast —— 用户刚亲手操作过。
@@ -158,6 +212,7 @@ final class PomodoroManager: ObservableObject {
         timer?.invalidate()
         timer = nil
         updateMenuBarDisplay()
+        syncFocusLinkage()
     }
 
     func screenDidBecomeAvailable(after lockedDuration: TimeInterval) {
@@ -196,7 +251,8 @@ final class PomodoroManager: ObservableObject {
         self.timer = timer
     }
 
-    private func fireIfDue(now: Date = Date()) {
+    /// internal 只为测试：自动转段的联动语义要能从外部指定「现在」。
+    func fireIfDue(now: Date = Date()) {
         guard let completedPhase = session.phase, session.isDue(at: now) else {
             // tolerance 允许提前触发，没到点就重新定回去。
             rescheduleTimer(now: now)
@@ -274,6 +330,64 @@ final class PomodoroManager: ObservableObject {
         persistSession()
         rescheduleTimer(now: now)
         updateMenuBarDisplay()
+        syncFocusLinkage()
+    }
+
+    // MARK: - 专注模式联动
+
+    /// 边沿触发的联动对齐点。任何状态流转之后调用：现算应当联动
+    /// （设置开 + 专注段计时中；暂停、就绪、休息、锁屏冻结都不算），
+    /// 与上次输出比较，变了才执行快捷指令。
+    private func syncFocusLinkage() {
+        let shouldEngage: Bool
+        if settings.pomodoroLinksFocusMode, session.phase == .focus,
+           case .running = session.status {
+            shouldEngage = true
+        } else {
+            shouldEngage = false
+        }
+        guard shouldEngage != isFocusLinkEngaged else { return }
+        isFocusLinkEngaged = shouldEngage
+
+        // 快捷指令是异步进程，发出去就不管 —— 状态正确性由本函数
+        // 的 diff 保证，不依赖这条 Task 何时跑完。
+        let bridge = focusModeBridge
+        let engaged = shouldEngage
+        Task { @MainActor in
+            let result = await bridge.setFocusEngaged(engaged)
+            if case .failure(.missing) = result {
+                self.presentFocusLinkageMissingToast()
+            }
+            // 其它失败 bridge 已留痕：不动状态、不弹框，下个边沿自然会重试。
+        }
+    }
+
+    /// 快捷指令被用户删掉时的唯一提醒。只提示一次，主按钮带去设置页
+    /// 重走创建流程 —— 不崩、不弹系统错误框，联动悄悄停在关闭态。
+    private func presentFocusLinkageMissingToast() {
+        guard !hasShownFocusLinkageWarning else { return }
+        hasShownFocusLinkageWarning = true
+        toastManager.showPomodoroToast(PomodoroToastRequest(
+            title: "专注模式联动已停",
+            subtitle: "未找到快捷指令，专注时不再自动开关专注模式",
+            systemImage: "moon.zzz.fill",
+            primaryTitle: "重新创建",
+            primaryAction: { [weak self] in self?.onRequestOpenSettings?() },
+            secondaryTitle: "忽略",
+            secondaryAction: nil
+        ))
+    }
+
+    /// 退出钩子：联动开着就跑关闭快捷指令恢复原状。
+    /// willTerminate 里异步起一个进程没问题 —— 子进程独立存活，
+    /// 不等它退出。
+    func handleAppWillTerminate() {
+        guard isFocusLinkEngaged else { return }
+        isFocusLinkEngaged = false
+        let bridge = focusModeBridge
+        Task { @MainActor in
+            _ = await bridge.setFocusEngaged(false)
+        }
     }
 
     /// 让菜单栏倒计时状态与 session 对齐：计时中挂秒级 Timer，

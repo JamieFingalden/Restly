@@ -86,6 +86,8 @@ final class ReminderSettingsTests: XCTestCase {
         XCTAssertTrue(settings.pomodoroAutoStartBreak)
         XCTAssertFalse(settings.pomodoroAutoStartFocus)
         XCTAssertTrue(settings.pomodoroShowsInMenuBar)
+        // 专注模式联动依赖用户自建的快捷指令，出厂必须关着。
+        XCTAssertFalse(settings.pomodoroLinksFocusMode)
 
         settings.pomodoroFocusMinutes = 50
         settings.pomodoroShortBreakMinutes = 10
@@ -94,6 +96,7 @@ final class ReminderSettingsTests: XCTestCase {
         settings.pomodoroAutoStartBreak = false
         settings.pomodoroAutoStartFocus = true
         settings.pomodoroShowsInMenuBar = false
+        settings.pomodoroLinksFocusMode = true
 
         let reloaded = ReminderSettings(defaults: defaults)
         XCTAssertEqual(reloaded.pomodoroFocusMinutes, 50)
@@ -103,6 +106,7 @@ final class ReminderSettingsTests: XCTestCase {
         XCTAssertFalse(reloaded.pomodoroAutoStartBreak)
         XCTAssertTrue(reloaded.pomodoroAutoStartFocus)
         XCTAssertFalse(reloaded.pomodoroShowsInMenuBar)
+        XCTAssertTrue(reloaded.pomodoroLinksFocusMode)
     }
 
     /// 番茄钟的设置一律 .other：它们和健康提醒的计时无关，
@@ -122,7 +126,30 @@ final class ReminderSettingsTests: XCTestCase {
         settings.pomodoroAutoStartBreak = false
         settings.pomodoroAutoStartFocus = true
         settings.pomodoroShowsInMenuBar = false
+        settings.pomodoroLinksFocusMode = true
 
-        XCTAssertEqual(changes, Array(repeating: .other, count: 7))
+        XCTAssertEqual(changes, Array(repeating: .other, count: 8))
+    }
+
+    /// 联动开关的翻转走独立回调（PomodoroManager 靠它立刻执行
+    /// 开启/关闭），读档初始化不算翻转、不触发。
+    @MainActor
+    func testLinksFocusModeChangeNotifiesCallbackButNotDuringLoad() {
+        let suiteName = "ReminderSettingsTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // 存档里已开启：初始化读档不应触发翻转回调。
+        defaults.set(true, forKey: "pomodoroLinksFocusMode")
+        let settings = ReminderSettings(defaults: defaults)
+
+        var notifications = 0
+        settings.onLinksFocusModeChange = { notifications += 1 }
+
+        XCTAssertEqual(settings.pomodoroLinksFocusMode, true)
+        XCTAssertEqual(notifications, 0, "初始化读档不算翻转")
+
+        settings.pomodoroLinksFocusMode = false
+        XCTAssertEqual(notifications, 1)
     }
 }

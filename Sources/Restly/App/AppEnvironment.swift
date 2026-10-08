@@ -24,7 +24,12 @@ final class AppEnvironment: ObservableObject {
             overlayController: overlayController,
             screenLockManager: screenLockManager
         )
-        let pomodoroManager = PomodoroManager(settings: settings, toastManager: toastManager)
+        let focusModeBridge = FocusModeBridge()
+        let pomodoroManager = PomodoroManager(
+            settings: settings,
+            toastManager: toastManager,
+            focusModeBridge: focusModeBridge
+        )
 
         // ScreenStateMonitor 的回调是一次性闭包属性，订阅者不止一个之后
         // 在组合根统一接线、fan-out 给两个 manager。
@@ -42,8 +47,13 @@ final class AppEnvironment: ObservableObject {
         let settingsWindowController = SettingsWindowController(
             settings: settings,
             manager: reminderManager,
-            launchAtLoginManager: launchAtLoginManager
+            launchAtLoginManager: launchAtLoginManager,
+            focusModeBridge: focusModeBridge
         )
+        // 联动失效 Toast 的「重新创建」把设置窗口带上来。
+        pomodoroManager.onRequestOpenSettings = { [weak settingsWindowController] in
+            settingsWindowController?.show()
+        }
 
         self.settings = settings
         self.reminderManager = reminderManager
