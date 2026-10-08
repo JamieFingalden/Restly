@@ -38,8 +38,13 @@ install -m 755 "${BIN_DIR}/Restly" "${CONTENTS_DIR}/MacOS/Restly"
 install -m 644 "${PROJECT_DIR}/Support/Info.plist" "${CONTENTS_DIR}/Info.plist"
 # 每次打包生成唯一构建号（git 短哈希 + 时间戳）：开发期间反复打体验包时，
 # 版本徽标能区分新旧，避免「0.2.0 到底是不是新版」的困惑。发版时正式版本号仍由 Support/Info.plist 控制。
+# CFBundleVersion 必须是纯数字（1–3 段句点分隔整数，Apple 文档要求）：
+# 用「仓库提交总数.月日时分」——提交数单调递增、时间戳区分同提交重打包。
+# git 短哈希放进独立诊断键 RestlyBuildStamp（黑匣子日志用于对齐 commit）。
+COMMIT_COUNT="$(git -C "${PROJECT_DIR}" rev-list --count HEAD)"
 BUILD_STAMP="$(git -C "${PROJECT_DIR}" rev-parse --short HEAD)-$(date +%m%d%H%M)"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_STAMP}" "${CONTENTS_DIR}/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${COMMIT_COUNT}.$(date +%m%d%H%M)" "${CONTENTS_DIR}/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :RestlyBuildStamp string ${BUILD_STAMP}" "${CONTENTS_DIR}/Info.plist"
 install -m 644 "${ICON_SOURCE_PATH}" "${CONTENTS_DIR}/Resources/RestlyIcon.png"
 install -m 644 "${PROJECT_DIR}/LICENSE" "${CONTENTS_DIR}/Resources/LICENSE"
 ditto "${ASSET_OUTPUT_DIR}/" "${CONTENTS_DIR}/Resources/"
