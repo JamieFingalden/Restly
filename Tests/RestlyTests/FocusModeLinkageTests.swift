@@ -24,6 +24,16 @@ final class FocusModeLinkageTests: XCTestCase {
         private var responses: [(status: Int32, output: String)] = []
         /// 挂住 run 命令不回结果（模拟 enable 在飞）。
         private let holdRuns: Bool
+        private let heldLock = NSLock()
+        private var heldCompletions: [(Int32, String) -> Void] = []
+        /// 释放所有挂起的 run（模拟慢 enable 终于跑完）。
+        func releaseHeldRuns() {
+            heldLock.lock()
+            let pending = heldCompletions
+            heldCompletions = []
+            heldLock.unlock()
+            pending.forEach { $0(0, "") }
+        }
         /// 每次 sign 调用前回调（序号从 0 起），供测试在精确时机取消。
         var signGate: ((Int) -> Void)?
 
@@ -42,7 +52,10 @@ final class FocusModeLinkageTests: XCTestCase {
                     argv: rest
                 ))
                 if holdRuns, rest.first == "run" {
-                    // 不调 completion：调用方永远停在 await 上。
+                    // 挂起：completion 存起来等 releaseHeldRuns。
+                    heldLock.lock()
+                    heldCompletions.append(completion)
+                    heldLock.unlock()
                     return
                 }
                 if rest.first == "sign" {
@@ -75,12 +88,14 @@ final class FocusModeLinkageTests: XCTestCase {
     /// 记录退出路径同步启动器的完整 argv（可注入抛错验证失败路径）。
     private final class SyncLaunchRecorder: @unchecked Sendable {
         private(set) var argvList: [[String]] = []
+        private(set) var lastLaunchDate: Date?
         let error: Error?
         init(shouldFail: Bool = false) {
             error = shouldFail ? NSError(domain: "test", code: 1) : nil
         }
         func record(_ arguments: [String]) throws {
             argvList.append(arguments)
+            lastLaunchDate = Date()
             if let error { throw error }
         }
     }
@@ -596,6 +611,85 @@ final class FocusModeLinkageTests: XCTestCase {
             [["/usr/bin/shortcuts", "run", "Restly 专注关闭"]],
             "enable 还在飞时退出也要发同步关闭（关闭幂等，宁可多发不可漏发）"
         )
+    }
+
+    // MARK: - 呈现延迟与开关竞态（codex 四轮 ①②）
+
+    /// 对话框退场动画期间 present 会被静默丢弃：统一推迟呈现的
+    /// 工具函数契约 —— 延迟到点前不执行、到点后执行。
+    @MainActor
+    func testDeferredPresentationRunsClosureAfterDelay() async {
+        final class FlagBox: @unchecked Sendable {
+            var flag = false
+        }
+        let box = FlagBox()
+        let task = SettingsView.presentAfterDialogDismissal(delay: .milliseconds(50)) {
+            box.flag = true
+        }
+        XCTAssertFalse(box.flag, "延迟到点前不得提前执行")
+        await task.value
+        XCTAssertTrue(box.flag, "延迟到点后必须执行")
+    }
+
+    /// await 检查返回后以「关后的设置」为准：已关闭一律不弹引导
+    /// （「关掉开关还会弹一键创建」缺的就是这个重读）。
+    func testShouldShowCreationGuideHonoursPostAwaitToggle() {
+        XCTAssertTrue(SettingsView.shouldShowCreationGuide(
+            isLinkageEnabled: true,
+            existence: .missing
+        ))
+        XCTAssertFalse(SettingsView.shouldShowCreationGuide(
+            isLinkageEnabled: false,
+            existence: .missing
+        ), "await 期间被关掉的功能不得再弹引导")
+        XCTAssertFalse(SettingsView.shouldShowCreationGuide(
+            isLinkageEnabled: true,
+            existence: .ready
+        ))
+    }
+
+    // MARK: - 退出保序（codex 四轮 ③）
+
+    /// 慢 enable 在飞时退出：同步关闭要等它结算完再拉（断言时序），
+    /// 而不是赛跑抢先。
+    @MainActor
+    func testTerminateWaitsForInFlightEnableBeforeLaunchingOff() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(holdRuns: true)
+        let recorder = SyncLaunchRecorder()
+        let bridge = makeBridge(runner: stub.runner, syncLaunchRecorder: recorder)
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        // enable 已挂起在飞：此时退出要等它结算（后台 0.3 秒后释放）。
+        final class Timestamps: @unchecked Sendable {
+            var releasedAt: Date?
+            var offLaunchedAt: Date?
+        }
+        let timestamps = Timestamps()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
+            timestamps.releasedAt = Date()
+            stub.releaseHeldRuns()
+        }
+
+        manager.handleAppWillTerminate()
+        await drain()
+
+        XCTAssertEqual(
+            recorder.argvList.first,
+            ["/usr/bin/shortcuts", "run", "Restly 专注关闭"]
+        )
+        let launchedAt = try? XCTUnwrap(recorder.lastLaunchDate)
+        let released = try? XCTUnwrap(timestamps.releasedAt)
+        if let launchedAt, let released {
+            XCTAssertGreaterThanOrEqual(
+                launchedAt, released,
+                "同步关闭必须等在飞 enable 结算完再拉"
+            )
+        }
     }
 
     // MARK: - 名字可配置

@@ -105,6 +105,12 @@ final class FocusModeBridge: ObservableObject {
     private let ensureAppRunning: AppRunningEnsurer
     private let workQueue = DispatchQueue(label: "com.restly.focus-mode-bridge")
 
+    /// 在飞 run 命令的记账：发起 enter、续体恢复 leave。退出的同步
+    /// 关闭先对它做有界等待 —— 否则 off 与队列上已在跑/排队的 enable
+    /// 赛跑（用户指认的开启指令可以很慢），慢 enable 后完成时专注
+    /// 模式被留开。
+    private let inFlightRuns = DispatchGroup()
+
     /// 一旦确认缺失就停止后续 run：用户删除快捷指令后，每次状态流转
     /// 都白起一个进程毫无意义，重建成功（或下次启动）才复位。
     private(set) var isMissing = false
@@ -253,8 +259,18 @@ final class FocusModeBridge: ObservableObject {
     /// 都可能没轮到执行，专注模式就被留在开着的状态 —— Process.run()
     /// 同步把子进程拉起（不 waitUntilExit），它独立于父进程存活。
     /// 拉起失败只留痕：下次启动恢复 running focus 时会重新联动。
+    /// 有界等待在飞 run 结算（≤2 秒）。等待的是后台队列上的子进程，
+    /// 不涉及主线程互等；超时也继续 —— willTerminate 容忍短暂阻塞，
+    /// 但不为它陪葬。
+    func waitForInFlightRuns(timeout: TimeInterval = 2) {
+        _ = inFlightRuns.wait(timeout: .now() + timeout)
+    }
+
     func launchOffShortcutSynchronously() {
         let currentNames = names
+        // 保序：先等在飞的 run 结算（有界 2 秒），再拉同步关闭 ——
+        // 关闭与慢 enable 赛跑输了的话，退出后专注模式仍开着。
+        waitForInFlightRuns(timeout: 2)
         do {
             try synchronousLauncher(["/usr/bin/shortcuts", "run", currentNames.off])
             DebugEventLog.shared.log("退出：已同步拉起关闭指令「\(currentNames.off)」")
@@ -690,7 +706,13 @@ final class FocusModeBridge: ObservableObject {
     }
 
     private func run(_ arguments: [String]) async -> (Int32, String) {
-        await withCheckedContinuation { continuation in
+        // leave 挂在续体恢复处：生产环境默认执行器把完成回调派回
+        // 主线程，willTerminate 阻塞主线程等待时最多等满超时 —— 但
+        // 子进程本身早已退出（waitUntilExit 先于回调派发），排序目标
+        // 仍达成；stub 同步完成的场景则精确等到位。
+        inFlightRuns.enter()
+        defer { inFlightRuns.leave() }
+        return await withCheckedContinuation { continuation in
             runner(["/usr/bin/shortcuts"] + arguments) { status, output in
                 continuation.resume(returning: (status, output))
             }

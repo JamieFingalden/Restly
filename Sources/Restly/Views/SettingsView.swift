@@ -19,6 +19,7 @@ struct SettingsView: View {
     /// 否则用户关掉等待页 400ms 后它又把 sheet 拉回来 —— 残留状态的
     /// 活教材，正是本轮要抓的那类回归。
     @State private var installSheetPresentationTask: Task<Void, Never>?
+    @State private var tutorialPresentationTask: Task<Void, Never>?
     @State private var showTutorial = false
     @State private var installTask: Task<Void, Never>?
     /// 「从已有快捷指令中选择」的选项名单，一次 list 缓存着用。
@@ -56,7 +57,11 @@ struct SettingsView: View {
             }
             Button("手动创建") {
                 DebugEventLog.shared.log("设置页：用户选择手动创建")
-                showTutorial = true
+                // 与等待页同一招：退场动画期间 present 会被静默丢弃，
+                // 看起来像点了没反应。
+                tutorialPresentationTask = Self.presentAfterDialogDismissal {
+                    showTutorial = true
+                }
             }
             Button("取消并关闭联动", role: .destructive) {
                 // 取消是唯一把开关拨回去的路径：联动开着而指令不存在，
@@ -287,9 +292,20 @@ struct SettingsView: View {
         isCheckingLinkage = true
         let existence = await focusModeBridge.checkShortcutsExist(forceRefresh: force)
         isCheckingLinkage = false
-        if autoGuideOnMissing, existence != .ready {
+        // await 期间用户可能已把开关关掉：以关后的设置为准收尾 ——
+        // 不给已关闭的功能弹引导（呈现决策见 shouldShowCreationGuide）。
+        if Self.shouldShowCreationGuide(
+            isLinkageEnabled: settings.pomodoroLinksFocusMode,
+            existence: existence
+        ) {
             showCreationChoice = true
         }
+    }
+
+    /// 检查返回后的呈现决策（纯函数钉契约）：联动开着且没就绪才弹
+    /// 创建引导；await 期间被关掉（isLinkageEnabled=false）一律收尾。
+    static func shouldShowCreationGuide(isLinkageEnabled: Bool, existence: FocusModeBridge.Existence) -> Bool {
+        isLinkageEnabled && existence != .ready
     }
 
     private func refreshLinkageStatusIfEnabled(force: Bool = false) {
@@ -299,6 +315,22 @@ struct SettingsView: View {
     /// 安装确认轮询的总量与节奏（15 次 × 2 秒 = 30 秒），超时即止。
     private static let installTotalSeconds = 30
     private static let installPollInterval: TimeInterval = 2
+
+    /// 对话框退场动画的时长上界：动画期间设置呈现状态会被 macOS
+    /// 静默丢弃，所有对话框动作触发的 sheet 都统一推迟这一拍。
+    static let dialogDismissalDelay: Duration = .milliseconds(400)
+
+    /// 对话框动作触发的 sheet 统一走这里推迟呈现（等待页与「手动
+    /// 创建」教程共用 —— 各抄一遍魔法数字迟早改岔）。
+    static func presentAfterDialogDismissal(
+        delay: Duration = dialogDismissalDelay,
+        _ present: @escaping @MainActor () -> Void
+    ) -> Task<Void, Never> {
+        Task { @MainActor in
+            try? await Task.sleep(for: delay)
+            present()
+        }
+    }
 
     /// 呈现任务到点时该把 sheet 置成什么：流程已有结局就让位（nil，
     /// 结局任务会写自己的终态），仍未定才上等待页。调用点与结局写入
@@ -330,11 +362,7 @@ struct SettingsView: View {
         DebugEventLog.shared.log("一键创建：流程启动")
         installTask?.cancel()
         installSheetPresentationTask?.cancel()
-        // 对话框还在退场动画时就设置 sheet 的呈现状态，macOS 会静默
-        // 丢弃（「点了没反应」的另一嫌疑）；推迟一拍再上等待页。
-        installSheetPresentationTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
-            guard !Task.isCancelled else { return }
+        installSheetPresentationTask = Self.presentAfterDialogDismissal {
             installSheet = Self.installSheetPresentationState(hasOutcome: false)
         }
         installTask = Task {
