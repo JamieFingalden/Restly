@@ -139,6 +139,15 @@ final class FocusModeBridge: ObservableObject {
     /// 开启，否则要等下一次流转才有机会。
     var onMissingCleared: (() -> Void)?
 
+    /// 最近一次真正成功应用的名字对（setFocusEngaged 成功即记账）。
+    /// nil = 尚未应用过任何一对。
+    private(set) var appliedNames: ShortcutNames?
+
+    /// 检测发现「生效名字对 ≠ 已应用名字对」且系统就绪时回调，带上
+    /// 旧名字对 —— manager 先对旧对执行幂等关闭，再按期望态开新对；
+    /// 不转场的话，暂停/退出会拿新对执行关闭，旧模式被留在开启状态。
+    var onAppliedNamesChanged: ((ShortcutNames) -> Void)?
+
     init(
         runner: ProcessRunner? = nil,
         namesProvider: @escaping NamesProvider = {
@@ -192,9 +201,15 @@ final class FocusModeBridge: ObservableObject {
     // MARK: - 联动执行
 
     /// 执行开启/关闭快捷指令。已确认缺失时直接短路，不再起进程。
-    func setFocusEngaged(_ engaged: Bool) async -> Result<Void, LinkageError> {
+    /// `explicitNames` 供名字转场用：对「旧对」执行关闭时要把指令
+    /// 打到旧名字上，而不是当前指认的新名字。成功时把显式对记为
+    /// 已应用（转场关闭旧对也会记账，随后新对开启再覆盖）。
+    func setFocusEngaged(
+        _ engaged: Bool,
+        with explicitNames: ShortcutNames? = nil
+    ) async -> Result<Void, LinkageError> {
         guard !isMissing else { return .failure(.missing) }
-        let currentNames = names
+        let currentNames = explicitNames ?? names
         let name = engaged ? currentNames.on : currentNames.off
         let (status, output) = await run(["run", name])
         guard status == 0 else {
@@ -208,6 +223,7 @@ final class FocusModeBridge: ObservableObject {
             NSLog("Restly 专注模式快捷指令「\(name)」执行失败（\(status)）：\(output)")
             return .failure(.failed(status: status, output: output))
         }
+        appliedNames = currentNames
         return .success(())
     }
 
@@ -220,6 +236,7 @@ final class FocusModeBridge: ObservableObject {
            cache.names == currentNames,
            Date().timeIntervalSince(cache.timestamp) < existenceCacheTTL {
             resetMissingIfReady(cache.result)
+            settleAppliedNamesIfNeeded(currentNames)
             return cache.result
         }
 
@@ -234,6 +251,7 @@ final class FocusModeBridge: ObservableObject {
         existenceCache = (currentNames, result, Date())
         recordExistence(result)
         resetMissingIfReady(result)
+        settleAppliedNamesIfNeeded(currentNames)
         return result
     }
 
@@ -276,8 +294,8 @@ final class FocusModeBridge: ObservableObject {
         _ = inFlightRuns.wait(timeout: .now() + timeout)
     }
 
-    func launchOffShortcutSynchronously() {
-        let currentNames = names
+    func launchOffShortcutSynchronously(named explicit: ShortcutNames? = nil) {
+        let currentNames = explicit ?? names
         // 保序：先等在飞的 run 结算（有界 5 秒），再拉同步关闭 ——
         // 关闭与慢 enable 赛跑输了的话，退出后专注模式仍开着。
         waitForInFlightRuns(timeout: 5)
@@ -606,34 +624,36 @@ final class FocusModeBridge: ObservableObject {
         at url: URL,
         preferredLanguages: [String] = Locale.preferredLanguages
     ) -> FocusTarget? {
-        // 最终兜底：勿扰模式的 identifier 全系统恒定，不依赖这份文件 ——
-        // 文件读取可能因打包身份被系统拒绝（实测：同一构建，终端启动的
-        // 进程读得到，open/Finder 启动的被拒，授权随签名身份漂移）。
-        // 一键创建永远不能死在「读不到配置」这一步。但本地化名映射
-        // 未覆盖时 fallback 为 nil：宁可不生成，不生成解析必失败的指令。
-        guard let fallbackDisplayName = resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages) else {
-            return nil
+        // 文件读不到时只剩勿扰兜底一条路：identifier 全系统恒定，但
+        // 本地化名映射未覆盖的语言（nl 等）下 displayName 无解 ——
+        // 宁可放弃生成走教程，不生成解析必失败的指令。注意这只影响
+        // 兜底级：用户自建模式的名字不需要任何本地化映射。
+        func dndFallbackOnly() -> FocusTarget? {
+            guard let displayName = resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages) else {
+                return nil
+            }
+            return FocusTarget(
+                identifier: "com.apple.donotdisturb.mode.default",
+                displayName: displayName
+            )
         }
-        let fallback = FocusTarget(
-            identifier: "com.apple.donotdisturb.mode.default",
-            displayName: fallbackDisplayName
-        )
 
         guard FileManager.default.fileExists(atPath: url.path) else {
-            DebugEventLog.shared.log("联动安装：专注模式配置文件不存在（\(url.path)），用勿扰兜底")
-            return fallback
+            DebugEventLog.shared.log("联动安装：专注模式配置文件不存在（\(url.path)），尝试勿扰兜底")
+            return dndFallbackOnly()
         }
+
         let data: Data
         do {
             data = try Data(contentsOf: url)
         } catch {
             DebugEventLog.shared.log("联动安装：专注模式配置读取失败 —— \(error.localizedDescription)，用勿扰兜底")
-            return fallback
+            return dndFallbackOnly()
         }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let entries = object["data"] as? [[String: Any]] else {
             DebugEventLog.shared.log("联动安装：专注模式配置解析失败，用勿扰兜底")
-            return fallback
+            return dndFallbackOnly()
         }
 
         var modes: [FocusTarget] = []
@@ -649,7 +669,7 @@ final class FocusModeBridge: ObservableObject {
         }
         guard !modes.isEmpty else {
             DebugEventLog.shared.log("联动安装：专注模式配置里没有任何模式，用勿扰兜底")
-            return fallback
+            return dndFallbackOnly()
         }
 
         // 关键词按「大小写不敏感的子串」匹配：用户起的「Deep Focus」
@@ -667,11 +687,12 @@ final class FocusModeBridge: ObservableObject {
             return stable
         }
         guard let dnd = modes.first(where: { $0.identifier == "com.apple.donotdisturb.mode.default" }) else {
-            // 名单里连勿扰都没有：静态勿扰兜底照给（identifier 恒定）。
-            DebugEventLog.shared.log("联动安装：配置里没有勿扰模式，用静态勿扰兜底")
-            return fallback
+            // 名单里连勿扰都没有，且上面两级也没选中：没有可解析目标。
+            DebugEventLog.shared.log("联动安装：配置里没有可解析的专注模式目标")
+            return nil
         }
         guard let displayName = resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages) else {
+            // 兜底到勿扰但本地化名无解：放弃生成，走教程。
             return nil
         }
         return FocusTarget(identifier: dnd.identifier, displayName: displayName)
@@ -736,6 +757,18 @@ final class FocusModeBridge: ObservableObject {
         isMissing = false
         DebugEventLog.shared.log("联动熔断复位：检测到两条指令均已就位")
         onMissingCleared?()
+    }
+
+    /// 就绪结算的另一半：生效名字对与已应用对不一致（用户改了指认）
+    /// 时触发转场钩子。新对记账在此完成，防重复转场；旧对关闭与新对
+    /// 开启由 manager 编排。
+    private func settleAppliedNamesIfNeeded(_ currentNames: ShortcutNames) {
+        guard let applied = appliedNames, applied != currentNames else { return }
+        DebugEventLog.shared.log(
+            "联动转场：生效名字对从「\(applied.on)/\(applied.off)」变为「\(currentNames.on)/\(currentNames.off)」"
+        )
+        appliedNames = currentNames
+        onAppliedNamesChanged?(applied)
     }
 
     private func run(_ arguments: [String]) async -> (Int32, String) {

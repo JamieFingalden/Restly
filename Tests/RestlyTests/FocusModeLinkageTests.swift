@@ -1216,6 +1216,68 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertTrue(opened.isEmpty, "生成失败不得打开任何文件")
     }
 
+    // MARK: - 名字转场（codex 六轮 ③）
+
+    /// 应用中（旧对已开启）→ 改指认成已就绪的新对：先跑旧关闭、
+    /// 再跑新开启 —— 不转场的话，暂停/退出会拿新对执行关闭，
+    /// 旧对的目标模式被留在开启状态。
+    @MainActor
+    func testAppliedNamesTransitionRunsOldOffThenNewOn() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(responses: [
+            (0, ""),                     // 旧对开启
+            (0, "新开\n新关\n"),          // 改名后的检测 ready
+            (0, ""),                     // 旧对关闭（转场）
+            (0, ""),                     // 新对开启（重结算）
+        ])
+        var names = FocusModeBridge.ShortcutNames(on: "旧开", off: "旧关")
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { names },
+            focusTargetProvider: { nil }
+        )
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        bridge.onAppliedNamesChanged = { oldNames in
+            manager.handleAppliedNamesTransition(from: oldNames)
+        }
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        XCTAssertEqual(bridge.appliedNames, .init(on: "旧开", off: "旧关"))
+
+        // 用户把指认改成已就绪的新对，随后任意一条结算路径重检。
+        names = .init(on: "新开", off: "新关")
+        _ = await bridge.checkShortcutsExist(forceRefresh: true)
+        await drain()
+
+        XCTAssertEqual(
+            runCalls(in: stub).map(\.name),
+            ["旧开", "旧关", "新开"],
+            "转场顺序：旧关闭在前，新开启在后"
+        )
+        XCTAssertEqual(bridge.appliedNames, .init(on: "新开", off: "新关"))
+    }
+
+    // MARK: - sheet 转场契约（codex 六轮 ②）
+
+    /// sheet→sheet 转场契约：两次延迟呈现按序执行（失败 sheet 的
+    /// 「看手动教程」就靠这个不被 macOS 丢弃）。
+    @MainActor
+    func testDeferredPresentationSupportsSequentialTransitions() async {
+        var sequence: [String] = []
+        let first = SettingsView.presentAfterDialogDismissal(delay: .milliseconds(10)) {
+            sequence.append("failure-out")
+        }
+        await first.value
+        let second = SettingsView.presentAfterDialogDismissal(delay: .milliseconds(10)) {
+            sequence.append("tutorial-in")
+        }
+        await second.value
+        XCTAssertEqual(sequence, ["failure-out", "tutorial-in"])
+    }
+
     /// 名字结算去重：值未变（submit 后紧跟的 blur、重复 blur）零副作用；
     /// 值变了或从未结算才需要结算。
     func testShortcutNameSettleNeededDeduplicates() {
@@ -1231,6 +1293,43 @@ final class FocusModeLinkageTests: XCTestCase {
             current: (on: "C", off: "D"),
             lastSettled: (on: "A", off: "B")
         ), "值变了要结算")
+    }
+
+    /// ① 本地化映射未覆盖（nl 等）不得误伤自定义模式：名字是用户
+    /// 起的、不需要本地化映射，Work Hours 应正常选中。
+    func testUnmappedLanguageStillSelectsCustomModes() throws {
+        let fixture = """
+        {"data": [{"modeConfigurations": {
+            "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}},
+            "com.apple.sleep.sleep-mode": {"mode": {"name": "Sleep", "modeIdentifier": "com.apple.sleep.sleep-mode"}},
+            "com.apple.focus.workhours": {"mode": {"name": "Work Hours", "modeIdentifier": "com.apple.focus.workhours"}}
+        }}]}
+        """
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-nl-\(UUID().uuidString).json")
+        try fixture.data(using: .utf8)!.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let target = try XCTUnwrap(
+            FocusModeBridge.readFocusTarget(at: url, preferredLanguages: ["nl-NL"])
+        )
+        XCTAssertEqual(target.identifier, "com.apple.focus.workhours")
+        XCTAssertEqual(target.displayName, "Work Hours")
+
+        // 只剩核心模式时才放弃（勿扰本地化名无解）。
+        let coreOnly = """
+        {"data": [{"modeConfigurations": {
+            "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}}
+        }}]}
+        """
+        let coreURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-nl-core-\(UUID().uuidString).json")
+        try coreOnly.data(using: .utf8)!.write(to: coreURL)
+        defer { try? FileManager.default.removeItem(at: coreURL) }
+        XCTAssertNil(
+            FocusModeBridge.readFocusTarget(at: coreURL, preferredLanguages: ["nl-NL"]),
+            "勿扰本地化名无解就放弃生成，走教程路线"
+        )
     }
 
     /// 配置文件读不到/解析失败/为空都不得让一键创建死掉：

@@ -95,8 +95,12 @@ struct SettingsView: View {
                 installSheet = .waiting(remainingSeconds: Self.installTotalSeconds)
                 runAutomaticInstall()
             } onShowTutorial: {
+                // sheet→sheet 转场也要推迟一拍：第一个 sheet 还在退场
+                // 时 present 第二个会被 macOS 静默丢弃。
                 installSheet = nil
-                showTutorial = true
+                tutorialPresentationTask = Self.presentAfterDialogDismissal {
+                    showTutorial = true
+                }
             }
         }
         .sheet(isPresented: $showTutorial) {

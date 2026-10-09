@@ -402,6 +402,19 @@ final class PomodoroManager: ObservableObject {
     /// 退出钩子：联动开着就跑关闭快捷指令恢复原状。
     /// willTerminate 里异步起一个进程没问题 —— 子进程独立存活，
     /// 不等它退出。
+    /// 名字转场（检测发现生效对 ≠ 已应用对）：先对旧对执行幂等关闭
+    /// （异步即可，不赶时间），再把应用态打回未应用让结算重开新对 ——
+    /// 否则暂停/退出会拿新对执行关闭，旧模式被留在开启状态。
+    /// Task 提交顺序即子进程队列顺序：旧关先于新开。
+    func handleAppliedNamesTransition(from oldNames: FocusModeBridge.ShortcutNames) {
+        let bridge = focusModeBridge
+        Task { @MainActor in
+            _ = await bridge.setFocusEngaged(false, with: oldNames)
+        }
+        isFocusLinkApplied = false
+        syncFocusLinkage()
+    }
+
     func handleAppWillTerminate() {
         // applied 是乐观记账：指令发起即置位（见 syncFocusLinkage），
         // 所以「刚开专注就退出」的在飞开启也会走到这里。关闭指令

@@ -48,6 +48,10 @@ final class AppEnvironment: ObservableObject {
         focusModeBridge.onMissingCleared = { [weak pomodoroManager] in
             pomodoroManager?.syncFocusLinkage()
         }
+        // 生效名字对变化（改指认后检测就绪）：旧对关、新对开的转场。
+        focusModeBridge.onAppliedNamesChanged = { [weak pomodoroManager] oldNames in
+            pomodoroManager?.handleAppliedNamesTransition(from: oldNames)
+        }
 
         // ScreenStateMonitor 的回调是一次性闭包属性，订阅者不止一个之后
         // 在组合根统一接线、fan-out 给两个 manager。
