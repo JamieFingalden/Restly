@@ -25,6 +25,11 @@ struct SettingsView: View {
     /// 「从已有快捷指令中选择」的选项名单，一次 list 缓存着用。
     @State private var availableShortcutNames: [String]?
     @State private var isLoadingShortcutNames = false
+    /// 名字结算的防抖任务与「上次已结算值」（submit+blur 连击去重）。
+    @State private var nameSettleTask: Task<Void, Never>?
+    @State private var lastSettledNames: (on: String, off: String)?
+    /// 名字结算的防抖窗口：连续击键只在停顿后结算一次。
+    static let nameSettleDebounce: Duration = .milliseconds(400)
 
     var body: some View {
         ZStack {
@@ -245,12 +250,42 @@ struct SettingsView: View {
         }
     }
 
-    /// 名字指认变化（下拉选择或手输提交）后的统一结算：强制重检
-    /// 就绪状态 —— 检测给出 .ready 时 bridge 复位熔断并触发
+    /// 名字指认变化（下拉选择、手输提交或失焦）后的统一结算：强制
+    /// 重检就绪状态 —— 检测给出 .ready 时 bridge 复位熔断并触发
     /// onMissingCleared，manager 随即补执行当前段的联动，不用等用户
     /// 另行刷新或重启。
+    ///
+    /// 防抖与去重：连续击键只在停顿后结算一次；「submit 后紧跟的
+    /// blur」与「值没变的重复 blur」靠 shortcutNameSettleNeeded 的
+    /// 值比对跳过，零副作用。
     private func settleAfterShortcutNameChange() {
-        Task { await refreshLinkageStatus(force: true) }
+        let current = (
+            on: settings.resolvedFocusLinkOnName,
+            off: settings.resolvedFocusLinkOffName
+        )
+        guard Self.shortcutNameSettleNeeded(current: current, lastSettled: lastSettledNames) else { return }
+        nameSettleTask?.cancel()
+        nameSettleTask = Task { @MainActor in
+            try? await Task.sleep(for: Self.nameSettleDebounce)
+            guard !Task.isCancelled else { return }
+            let settled = (
+                on: settings.resolvedFocusLinkOnName,
+                off: settings.resolvedFocusLinkOffName
+            )
+            guard Self.shortcutNameSettleNeeded(current: settled, lastSettled: lastSettledNames) else { return }
+            lastSettledNames = settled
+            await refreshLinkageStatus(force: true)
+        }
+    }
+
+    /// 结算去重契约：与上次已结算值相同 → 跳过；值变了（或从未结算）
+    /// → 结算。
+    static func shortcutNameSettleNeeded(
+        current: (on: String, off: String),
+        lastSettled: (on: String, off: String)?
+    ) -> Bool {
+        guard let lastSettled else { return true }
+        return current != lastSettled
     }
 
     private func shortcutNameRow(
@@ -285,6 +320,10 @@ struct SettingsView: View {
             .fixedSize()
         }
         .font(.system(size: 12.5, design: .rounded))
+        // 失焦/编辑结束：macOS 13 没有 onFocusChange，用编辑值变化 +
+        // 防抖兜住「不按回车直接点别处」的未结算编辑；值未变由
+        // settle 的去重跳过。
+        .onChange(of: binding.wrappedValue) { _ in settleAfterShortcutNameChange() }
         .onSubmit { settleAfterShortcutNameChange() }
     }
 
@@ -308,16 +347,23 @@ struct SettingsView: View {
         // 不给已关闭的功能弹引导（呈现决策见 shouldShowCreationGuide）。
         if Self.shouldShowCreationGuide(
             isLinkageEnabled: settings.pomodoroLinksFocusMode,
-            existence: existence
+            existence: existence,
+            autoGuide: autoGuideOnMissing
         ) {
             showCreationChoice = true
         }
     }
 
-    /// 检查返回后的呈现决策（纯函数钉契约）：联动开着且没就绪才弹
-    /// 创建引导；await 期间被关掉（isLinkageEnabled=false）一律收尾。
-    static func shouldShowCreationGuide(isLinkageEnabled: Bool, existence: FocusModeBridge.Existence) -> Bool {
-        isLinkageEnabled && existence != .ready
+    /// 检查返回后的呈现决策（纯函数钉契约）：联动开着、没就绪、且
+    /// 本次刷新来自用户主动动作（autoGuide）才弹创建引导 —— onAppear、
+    /// 教程关闭后的例行刷新（autoGuide=false）不弹，否则刚关掉教程
+    /// 又立刻被弹；await 期间被关掉（isLinkageEnabled=false）一律收尾。
+    static func shouldShowCreationGuide(
+        isLinkageEnabled: Bool,
+        existence: FocusModeBridge.Existence,
+        autoGuide: Bool
+    ) -> Bool {
+        isLinkageEnabled && autoGuide && existence != .ready
     }
 
     private func refreshLinkageStatusIfEnabled(force: Bool = false) {

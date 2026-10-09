@@ -81,7 +81,15 @@ final class FocusModeBridge: ObservableObject {
     /// 进程执行器。参数是完整 argv，回调带回退出码与合并后的标准输出/错误。
     /// 回调不绑执行者（默认实现在主队列上回调），可注入以便测试桩替换，
     /// 真实进程的串行化由默认实现保证。
-    typealias ProcessRunner = @Sendable (_ arguments: [String], _ completion: @escaping @Sendable (Int32, String) -> Void) -> Void
+    /// onProcessExit 在子进程退出时、于执行器的后台队列上同步回调
+    /// （先于 completion）—— 退出保序的 leave 挂在这里，与 completion
+    /// 的派发线程彻底解耦（Grove：leave 若等主线程恢复，会被退出
+    /// 路径阻塞主线程的有界等待卡满预算，保序失效）。
+    typealias ProcessRunner = @Sendable (
+        _ arguments: [String],
+        _ onProcessExit: @escaping @Sendable () -> Void,
+        _ completion: @escaping @Sendable (Int32, String) -> Void
+    ) -> Void
 
     /// 存在性结果的 TTL。设置页开关流程里的重复检查与失败确认
     /// 都落在缓存上，同一分钟内不会重复起 list 进程。
@@ -259,18 +267,20 @@ final class FocusModeBridge: ObservableObject {
     /// 都可能没轮到执行，专注模式就被留在开着的状态 —— Process.run()
     /// 同步把子进程拉起（不 waitUntilExit），它独立于父进程存活。
     /// 拉起失败只留痕：下次启动恢复 running focus 时会重新联动。
-    /// 有界等待在飞 run 结算（≤2 秒）。等待的是后台队列上的子进程，
-    /// 不涉及主线程互等；超时也继续 —— willTerminate 容忍短暂阻塞，
-    /// 但不为它陪葬。
-    func waitForInFlightRuns(timeout: TimeInterval = 2) {
+    /// 有界等待在飞 run 结算（≤5 秒）。等待的是后台队列上的子进程，
+    /// 不涉及主线程互等（leave 已随子进程退出在后台队列触发）；超时
+    /// 也继续 —— willTerminate 容忍短暂阻塞，但不为它陪葬。预算从
+    /// 2 秒提到 5 秒：leave 与主线程派发解耦后，等待会精确结束在
+    /// 子进程退出时刻，5 秒足以覆盖慢的「设置专注模式」指令。
+    func waitForInFlightRuns(timeout: TimeInterval = 5) {
         _ = inFlightRuns.wait(timeout: .now() + timeout)
     }
 
     func launchOffShortcutSynchronously() {
         let currentNames = names
-        // 保序：先等在飞的 run 结算（有界 2 秒），再拉同步关闭 ——
+        // 保序：先等在飞的 run 结算（有界 5 秒），再拉同步关闭 ——
         // 关闭与慢 enable 赛跑输了的话，退出后专注模式仍开着。
-        waitForInFlightRuns(timeout: 2)
+        waitForInFlightRuns(timeout: 5)
         do {
             try synchronousLauncher(["/usr/bin/shortcuts", "run", currentNames.off])
             DebugEventLog.shared.log("退出：已同步拉起关闭指令「\(currentNames.off)」")
@@ -301,9 +311,17 @@ final class FocusModeBridge: ObservableObject {
         do {
             files = try generateShortcutFiles()
         } catch {
-            DebugEventLog.shared.log("联动安装：生成失败 —— \(error.localizedDescription)")
-            NSLog("Restly 生成专注模式快捷指令文件失败：\(error.localizedDescription)")
-            return .generationFailed(error.localizedDescription)
+            // noFocusTarget 现只可能来自「本地化名无法确定」（宁可不
+            // 生成，不生成坏的），给出带指引的原因让教程路线收尾。
+            let reason: String
+            if let linkageError = error as? LinkageError, linkageError == .noFocusTarget {
+                reason = "当前系统语言无法确定勿扰模式的本地化名称，请改用手动创建"
+            } else {
+                reason = error.localizedDescription
+            }
+            DebugEventLog.shared.log("联动安装：生成失败 —— \(reason)")
+            NSLog("Restly 生成专注模式快捷指令文件失败：\(reason)")
+            return .generationFailed(reason)
         }
         guard files.count == 2 else {
             DebugEventLog.shared.log("联动安装：生成结果不完整（\(files.count) 个文件）")
@@ -570,14 +588,18 @@ final class FocusModeBridge: ObservableObject {
     /// 规范英文名 —— DisplayString 是运行时的名字解析键，中文兜底在
     /// 非中文系统上必然「不存在名为勿扰模式的专注模式」。回退时记
     /// 黑匣子一行，教程「导入后确认目标」就是这条路的出路。
+    /// nil = 本地化映射未覆盖当前语言（nl/pl 等）。DisplayString 是
+    /// 运行时的名字解析键，写死英文名生成的指令必然「不存在名为…」
+    /// 静默挂掉 —— 宁可不生成（退手动教程），不生成坏的。配置文件里
+    /// 的 name 是未本地化规范名，同样不能拿来充当本地化名。
     nonisolated private static func resolveDoNotDisturbDisplayName(
         preferredLanguages: [String]
-    ) -> String {
+    ) -> String? {
         if let localized = localizedDoNotDisturbName(preferredLanguages: preferredLanguages) {
             return localized
         }
-        DebugEventLog.shared.log("联动安装：语言未覆盖本地化映射，回退英文名，导入后需确认目标模式")
-        return "Do Not Disturb"
+        DebugEventLog.shared.log("联动安装：语言未覆盖本地化映射，无法确定勿扰模式的本地化名称，放弃生成勿扰路线")
+        return nil
     }
 
     nonisolated static func readFocusTarget(
@@ -587,10 +609,14 @@ final class FocusModeBridge: ObservableObject {
         // 最终兜底：勿扰模式的 identifier 全系统恒定，不依赖这份文件 ——
         // 文件读取可能因打包身份被系统拒绝（实测：同一构建，终端启动的
         // 进程读得到，open/Finder 启动的被拒，授权随签名身份漂移）。
-        // 一键创建永远不能死在「读不到配置」这一步。
+        // 一键创建永远不能死在「读不到配置」这一步。但本地化名映射
+        // 未覆盖时 fallback 为 nil：宁可不生成，不生成解析必失败的指令。
+        guard let fallbackDisplayName = resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages) else {
+            return nil
+        }
         let fallback = FocusTarget(
             identifier: "com.apple.donotdisturb.mode.default",
-            displayName: resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages)
+            displayName: fallbackDisplayName
         )
 
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -645,10 +671,10 @@ final class FocusModeBridge: ObservableObject {
             DebugEventLog.shared.log("联动安装：配置里没有勿扰模式，用静态勿扰兜底")
             return fallback
         }
-        return FocusTarget(
-            identifier: dnd.identifier,
-            displayName: resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages)
-        )
+        guard let displayName = resolveDoNotDisturbDisplayName(preferredLanguages: preferredLanguages) else {
+            return nil
+        }
+        return FocusTarget(identifier: dnd.identifier, displayName: displayName)
     }
 
     /// 系统勿扰模式的本地化显示名（运行时按它匹配）。按用户首选语言
@@ -713,14 +739,14 @@ final class FocusModeBridge: ObservableObject {
     }
 
     private func run(_ arguments: [String]) async -> (Int32, String) {
-        // leave 挂在续体恢复处：生产环境默认执行器把完成回调派回
-        // 主线程，willTerminate 阻塞主线程等待时最多等满超时 —— 但
-        // 子进程本身早已退出（waitUntilExit 先于回调派发），排序目标
-        // 仍达成；stub 同步完成的场景则精确等到位。
+        // leave 挂在 onProcessExit（子进程退出、后台队列）而非续体
+        // 恢复处：续体要跳回主 actor，而退出路径正阻塞主线程做有界
+        // 等待 —— leave 若排在主线程后面，等待必然耗满预算，慢于
+        // 预算的开启指令仍在飞时就拉关闭，保序失效（Grove 实证）。
+        let processExitGroup = inFlightRuns
         inFlightRuns.enter()
-        defer { inFlightRuns.leave() }
         return await withCheckedContinuation { continuation in
-            runner(["/usr/bin/shortcuts"] + arguments) { status, output in
+            runner(["/usr/bin/shortcuts"] + arguments, { processExitGroup.leave() }) { status, output in
                 continuation.resume(returning: (status, output))
             }
         }
@@ -730,7 +756,7 @@ final class FocusModeBridge: ObservableObject {
     /// 同一时刻最多一个 shortcuts 进程；主线程只负责收结果。
     /// internal 只为测试：直测「大输出不死锁」的并发消费契约。
     nonisolated static func defaultRunner(workQueue: DispatchQueue) -> ProcessRunner {
-        return { arguments, completion in
+        return { arguments, onProcessExit, completion in
             workQueue.async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: arguments[0])
@@ -768,13 +794,17 @@ final class FocusModeBridge: ObservableObject {
                 process.waitUntilExit()
                 group.wait()
 
+                // 子进程已退出：先回调退出信号（退出的 leave 在此，
+                // 后台队列上、不依赖任何主线程恢复），再送结果。
+                onProcessExit()
+
                 // stdout + stderr 合并收一份：list 的名字和报错文案都在
                 // 里面，失败时输出继续用于诊断。
                 let text = String(decoding: buffer.data, as: UTF8.self)
                 let status = process.terminationStatus
-                DispatchQueue.main.async {
-                    completion(status, text)
-                }
+                // 不派回主线程：await 侧是 MainActor 隔离的，续体恢复
+                // 会自动跳回主 actor；在这里再跳一次只会拖慢退出保序。
+                completion(status, text)
             }
         }
     }

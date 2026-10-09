@@ -25,14 +25,14 @@ final class FocusModeLinkageTests: XCTestCase {
         /// 挂住 run 命令不回结果（模拟 enable 在飞）。
         private let holdRuns: Bool
         private let heldLock = NSLock()
-        private var heldCompletions: [(Int32, String) -> Void] = []
+        private var heldCompletions: [@Sendable () -> Void] = []
         /// 释放所有挂起的 run（模拟慢 enable 终于跑完）。
         func releaseHeldRuns() {
             heldLock.lock()
             let pending = heldCompletions
             heldCompletions = []
             heldLock.unlock()
-            pending.forEach { $0(0, "") }
+            pending.forEach { $0() }
         }
         /// 每次 sign 调用前回调（序号从 0 起），供测试在精确时机取消。
         var signGate: ((Int) -> Void)?
@@ -43,7 +43,7 @@ final class FocusModeLinkageTests: XCTestCase {
         }
 
         var runner: FocusModeBridge.ProcessRunner {
-            { [self] arguments, completion in
+            { [self] arguments, onProcessExit, completion in
                 // argv[0] 是 /usr/bin/shortcuts，后面才是子命令与参数。
                 let rest = Array(arguments.dropFirst())
                 invocations.append(Invocation(
@@ -52,9 +52,13 @@ final class FocusModeLinkageTests: XCTestCase {
                     argv: rest
                 ))
                 if holdRuns, rest.first == "run" {
-                    // 挂起：completion 存起来等 releaseHeldRuns。
+                    // 挂起：子进程退出信号与完成回调一起存起来，
+                    // 等 releaseHeldRuns 按序触发。
                     heldLock.lock()
-                    heldCompletions.append(completion)
+                    heldCompletions.append { [onProcessExit, completion] in
+                        onProcessExit()
+                        completion(0, "")
+                    }
                     heldLock.unlock()
                     return
                 }
@@ -62,6 +66,7 @@ final class FocusModeLinkageTests: XCTestCase {
                     let signCount = invocations.filter { $0.command == "sign" }.count
                     signGate?(signCount - 1)
                 }
+                onProcessExit()
                 let response = responses.isEmpty ? (Int32(0), "") : responses.removeFirst()
                 // 模拟真 sign 的契约：成功时要在 -o 位置产出文件，
                 // 否则 bridge 的「签名后写回原路径」无从谈起。
@@ -527,7 +532,7 @@ final class FocusModeLinkageTests: XCTestCase {
         }
         let box = OutputBox()
         let expectation = XCTestExpectation(description: "默认执行器返回大输出")
-        runner(["/bin/sh", "-c", "head -c 200000 /dev/zero | base64"]) { status, output in
+        runner(["/bin/sh", "-c", "head -c 200000 /dev/zero | base64"], {}) { status, output in
             box.status = status
             box.output = output
             expectation.fulfill()
@@ -546,7 +551,7 @@ final class FocusModeLinkageTests: XCTestCase {
         }
         let box = OutputBox()
         let expectation = XCTestExpectation(description: "默认执行器带回失败输出")
-        runner(["/bin/sh", "-c", "echo boom; exit 3"]) { status, output in
+        runner(["/bin/sh", "-c", "echo boom; exit 3"], {}) { status, output in
             box.status = status
             box.output = output
             expectation.fulfill()
@@ -701,27 +706,38 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertTrue(box.flag, "延迟到点后必须执行")
     }
 
-    /// await 检查返回后以「关后的设置」为准：已关闭一律不弹引导
-    /// （「关掉开关还会弹一键创建」缺的就是这个重读）。
-    func testShouldShowCreationGuideHonoursPostAwaitToggle() {
+    /// await 检查返回后以「关后的设置」为准：已关闭一律不弹引导；
+    /// 例行刷新（onAppear/教程关闭，autoGuide=false）不弹，只有用户
+    /// 主动动作（autoGuide=true）缺失时才弹 —— 否则刚关掉教程又被弹。
+    func testShouldShowCreationGuideHonoursPostAwaitToggleAndAutoGuide() {
         XCTAssertTrue(SettingsView.shouldShowCreationGuide(
             isLinkageEnabled: true,
-            existence: .missing
+            existence: .missing,
+            autoGuide: true
         ))
         XCTAssertFalse(SettingsView.shouldShowCreationGuide(
+            isLinkageEnabled: true,
+            existence: .missing,
+            autoGuide: false
+        ), "例行刷新不得自动弹引导")
+        XCTAssertFalse(SettingsView.shouldShowCreationGuide(
             isLinkageEnabled: false,
-            existence: .missing
+            existence: .missing,
+            autoGuide: true
         ), "await 期间被关掉的功能不得再弹引导")
         XCTAssertFalse(SettingsView.shouldShowCreationGuide(
             isLinkageEnabled: true,
-            existence: .ready
+            existence: .ready,
+            autoGuide: true
         ))
     }
 
     // MARK: - 退出保序（codex 四轮 ③）
 
-    /// 慢 enable 在飞时退出：同步关闭要等它结算完再拉（断言时序），
-    /// 而不是赛跑抢先。
+    /// 慢 enable（挂 2.5 秒）在飞时退出：leave 挂在子进程退出点
+    /// （后台队列），等待不被主线程派发卡死 —— 同步关闭必须在 run
+    /// 结算之后才拉起（顺序断言，Grove 对第十一轮「必然耗满预算」
+    /// 判无效后的重点回归）。
     @MainActor
     func testTerminateWaitsForInFlightEnableBeforeLaunchingOff() async {
         let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
@@ -734,14 +750,14 @@ final class FocusModeLinkageTests: XCTestCase {
 
         manager.startFocus()
         await drain()
-        // enable 已挂起在飞：此时退出要等它结算（后台 0.3 秒后释放）。
+        // enable 已挂起在飞；后台 2.5 秒后才结算（慢指令）。
         final class Timestamps: @unchecked Sendable {
-            var releasedAt: Date?
+            var settledAt: Date?
             var offLaunchedAt: Date?
         }
         let timestamps = Timestamps()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
-            timestamps.releasedAt = Date()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) {
+            timestamps.settledAt = Date()
             stub.releaseHeldRuns()
         }
 
@@ -753,11 +769,11 @@ final class FocusModeLinkageTests: XCTestCase {
             ["/usr/bin/shortcuts", "run", "Restly 专注关闭"]
         )
         let launchedAt = try? XCTUnwrap(recorder.lastLaunchDate)
-        let released = try? XCTUnwrap(timestamps.releasedAt)
-        if let launchedAt, let released {
+        let settled = try? XCTUnwrap(timestamps.settledAt)
+        if let launchedAt, let settled {
             XCTAssertGreaterThanOrEqual(
-                launchedAt, released,
-                "同步关闭必须等在飞 enable 结算完再拉"
+                launchedAt, settled,
+                "同步关闭必须晚于在飞 enable 的结算（顺序断言）"
             )
         }
     }
@@ -1158,10 +1174,63 @@ final class FocusModeLinkageTests: XCTestCase {
         )
         XCTAssertEqual(english.displayName, "Do Not Disturb")
 
-        let unmapped = try XCTUnwrap(
-            FocusModeBridge.readFocusTarget(at: url, preferredLanguages: ["xx-YY"])
+        // 宁可不生成，不生成解析必失败的指令（Grove/codex 维持立场）。
+        XCTAssertNil(
+            FocusModeBridge.readFocusTarget(at: url, preferredLanguages: ["xx-YY"]),
+            "映射不到就别给 DisplayString，让安装走教程路线"
         )
-        XCTAssertEqual(unmapped.displayName, "Do Not Disturb", "映射不到退回规范名，靠教程提示兜底")
+    }
+
+    /// 未覆盖语言的勿扰兜底整条链：readFocusTarget nil → 安装报
+    /// generationFailed 且原因带指引 → 零打开。
+    @MainActor
+    func testUnmappedLanguageSkipsGenerationInsteadOfEmittingBrokenShortcut() async throws {
+        let fixture = """
+        {"data": [{"modeConfigurations": {
+            "com.apple.donotdisturb.mode.default": {"mode": {"name": "Do Not Disturb", "modeIdentifier": "com.apple.donotdisturb.mode.default"}}
+        }}]}
+        """
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RestlyFocusTest-unmapped-\(UUID().uuidString).json")
+        try fixture.data(using: .utf8)!.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        // nl 等未覆盖语言下 provider 返回 nil。
+        XCTAssertNil(FocusModeBridge.readFocusTarget(at: url, preferredLanguages: ["nl-NL"]))
+
+        let stub = RunnerStub()
+        var opened: [String] = []
+        let bridge = makeBridge(
+            runner: stub.runner,
+            target: nil,   // 与 readFocusTarget 返回 nil 的链路等价
+            openHandler: { opened.append($0.lastPathComponent); return true }
+        )
+
+        let outcome = await bridge.installShortcuts()
+
+        guard case .generationFailed(let reason) = outcome else {
+            return XCTFail("未覆盖语言应走 generationFailed，实际 \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("本地化名称"), "原因要写明症结：\(reason)")
+        XCTAssertTrue(reason.contains("手动创建"), "原因要给出路：\(reason)")
+        XCTAssertTrue(opened.isEmpty, "生成失败不得打开任何文件")
+    }
+
+    /// 名字结算去重：值未变（submit 后紧跟的 blur、重复 blur）零副作用；
+    /// 值变了或从未结算才需要结算。
+    func testShortcutNameSettleNeededDeduplicates() {
+        XCTAssertFalse(SettingsView.shortcutNameSettleNeeded(
+            current: (on: "设定专注模式", off: "关闭专注模式"),
+            lastSettled: (on: "设定专注模式", off: "关闭专注模式")
+        ), "值未变（submit+blur 连击）不得重复结算")
+        XCTAssertTrue(SettingsView.shortcutNameSettleNeeded(
+            current: (on: "设定专注模式", off: "关闭专注模式"),
+            lastSettled: nil
+        ), "从未结算过要结算")
+        XCTAssertTrue(SettingsView.shortcutNameSettleNeeded(
+            current: (on: "C", off: "D"),
+            lastSettled: (on: "A", off: "B")
+        ), "值变了要结算")
     }
 
     /// 配置文件读不到/解析失败/为空都不得让一键创建死掉：
