@@ -11,6 +11,9 @@ final class AppEnvironment: ObservableObject {
     private var menuPreviewWindowController: MenuPreviewWindowController?
 
     init() {
+        // 黑匣子分隔行：日志跨启动追加，靠它分段，并记下这次跑的是
+        // 哪个构建（「哪个实例」的悬案靠它终结）。
+        DebugEventLog.shared.logLaunchSeparator()
         let arguments = ProcessInfo.processInfo.arguments
         let settings = ReminderSettings()
         let screenStateMonitor = ScreenStateMonitor()
@@ -24,7 +27,31 @@ final class AppEnvironment: ObservableObject {
             overlayController: overlayController,
             screenLockManager: screenLockManager
         )
-        let pomodoroManager = PomodoroManager(settings: settings, toastManager: toastManager)
+        // 联动快捷指令的名字跟着设置走：用户指认自己已有的指令，
+        // bridge 每次 run / 检测都现取，改完即生效。
+        let focusModeBridge = FocusModeBridge(namesProvider: { [weak settings] in
+            guard let settings else {
+                return .init(on: FocusModeBridge.defaultOnShortcutName, off: FocusModeBridge.defaultOffShortcutName)
+            }
+            return .init(
+                on: settings.resolvedFocusLinkOnName,
+                off: settings.resolvedFocusLinkOffName
+            )
+        })
+        let pomodoroManager = PomodoroManager(
+            settings: settings,
+            toastManager: toastManager,
+            focusModeBridge: focusModeBridge
+        )
+        // 熔断在安装成功/重检就绪时复位：正在计时的这段专注要补上
+        // 开启指令，别等下一次流转。
+        focusModeBridge.onMissingCleared = { [weak pomodoroManager] in
+            pomodoroManager?.syncFocusLinkage()
+        }
+        // 生效名字对变化（改指认后检测就绪）：旧对关、新对开的转场。
+        focusModeBridge.onAppliedNamesChanged = { [weak pomodoroManager] oldNames in
+            pomodoroManager?.handleAppliedNamesTransition(from: oldNames)
+        }
 
         // ScreenStateMonitor 的回调是一次性闭包属性，订阅者不止一个之后
         // 在组合根统一接线、fan-out 给两个 manager。
@@ -42,8 +69,13 @@ final class AppEnvironment: ObservableObject {
         let settingsWindowController = SettingsWindowController(
             settings: settings,
             manager: reminderManager,
-            launchAtLoginManager: launchAtLoginManager
+            launchAtLoginManager: launchAtLoginManager,
+            focusModeBridge: focusModeBridge
         )
+        // 联动失效 Toast 的「重新创建」把设置窗口带上来。
+        pomodoroManager.onRequestOpenSettings = { [weak settingsWindowController] in
+            settingsWindowController?.show()
+        }
 
         self.settings = settings
         self.reminderManager = reminderManager

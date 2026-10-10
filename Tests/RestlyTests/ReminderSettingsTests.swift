@@ -86,6 +86,8 @@ final class ReminderSettingsTests: XCTestCase {
         XCTAssertTrue(settings.pomodoroAutoStartBreak)
         XCTAssertFalse(settings.pomodoroAutoStartFocus)
         XCTAssertTrue(settings.pomodoroShowsInMenuBar)
+        // 专注模式联动依赖用户自建的快捷指令，出厂必须关着。
+        XCTAssertFalse(settings.pomodoroLinksFocusMode)
 
         settings.pomodoroFocusMinutes = 50
         settings.pomodoroShortBreakMinutes = 10
@@ -94,6 +96,7 @@ final class ReminderSettingsTests: XCTestCase {
         settings.pomodoroAutoStartBreak = false
         settings.pomodoroAutoStartFocus = true
         settings.pomodoroShowsInMenuBar = false
+        settings.pomodoroLinksFocusMode = true
 
         let reloaded = ReminderSettings(defaults: defaults)
         XCTAssertEqual(reloaded.pomodoroFocusMinutes, 50)
@@ -103,6 +106,7 @@ final class ReminderSettingsTests: XCTestCase {
         XCTAssertFalse(reloaded.pomodoroAutoStartBreak)
         XCTAssertTrue(reloaded.pomodoroAutoStartFocus)
         XCTAssertFalse(reloaded.pomodoroShowsInMenuBar)
+        XCTAssertTrue(reloaded.pomodoroLinksFocusMode)
     }
 
     /// 番茄钟的设置一律 .other：它们和健康提醒的计时无关，
@@ -122,7 +126,74 @@ final class ReminderSettingsTests: XCTestCase {
         settings.pomodoroAutoStartBreak = false
         settings.pomodoroAutoStartFocus = true
         settings.pomodoroShowsInMenuBar = false
+        settings.pomodoroLinksFocusMode = true
+        settings.focusLinkOnShortcutName = "设定专注模式"
+        settings.focusLinkOffShortcutName = "关闭专注模式"
 
-        XCTAssertEqual(changes, Array(repeating: .other, count: 7))
+        XCTAssertEqual(changes, Array(repeating: .other, count: 10))
+    }
+
+    /// 联动指令名字：空 = 跟随默认（存档里绝不出现「默认值伪装成
+    /// 用户指认」），输入才落盘且去掉首尾空白；清空删键回退默认。
+    @MainActor
+    func testFocusLinkShortcutNamesClearDoesNotPersistDefault() {
+        let (settings, suiteName, defaults) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // 出厂（无存档键）：字段为空、取值口径回退默认。
+        XCTAssertEqual(settings.focusLinkOnShortcutName, "")
+        XCTAssertEqual(settings.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
+        XCTAssertEqual(settings.resolvedFocusLinkOffName, FocusModeBridge.defaultOffShortcutName)
+        XCTAssertNil(defaults.string(forKey: "focusLinkOnShortcutName"))
+
+        // 指认：去空白后落盘，读回一致。
+        settings.focusLinkOnShortcutName = "  设定专注模式  "
+        settings.focusLinkOffShortcutName = "关闭专注模式"
+        XCTAssertEqual(defaults.string(forKey: "focusLinkOnShortcutName"), "设定专注模式")
+        XCTAssertEqual(defaults.string(forKey: "focusLinkOffShortcutName"), "关闭专注模式")
+        let reloaded = ReminderSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.resolvedFocusLinkOnName, "设定专注模式")
+        XCTAssertEqual(reloaded.resolvedFocusLinkOffName, "关闭专注模式")
+
+        // 清空：删键，不落默认值；取值口径回退默认，重开也是空字段。
+        reloaded.focusLinkOnShortcutName = "   "
+        XCTAssertNil(defaults.string(forKey: "focusLinkOnShortcutName"), "清空不该把默认名写进存档")
+        XCTAssertEqual(reloaded.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
+        let reloadedAgain = ReminderSettings(defaults: defaults)
+        XCTAssertEqual(reloadedAgain.focusLinkOnShortcutName, "")
+        XCTAssertEqual(reloadedAgain.resolvedFocusLinkOnName, FocusModeBridge.defaultOnShortcutName)
+    }
+
+    /// 联动开关的翻转走独立回调（PomodoroManager 靠它立刻执行
+    /// 开启/关闭），读档初始化不算翻转、不触发。
+    @MainActor
+    func testLinksFocusModeChangeNotifiesCallbackButNotDuringLoad() {
+        let suiteName = "ReminderSettingsTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // 存档里已开启：初始化读档不应触发翻转回调。
+        defaults.set(true, forKey: "pomodoroLinksFocusMode")
+        let settings = ReminderSettings(defaults: defaults)
+
+        var notifications = 0
+        settings.onLinksFocusModeChange = { notifications += 1 }
+
+        XCTAssertEqual(settings.pomodoroLinksFocusMode, true)
+        XCTAssertEqual(notifications, 0, "初始化读档不算翻转")
+
+        settings.pomodoroLinksFocusMode = false
+        XCTAssertEqual(notifications, 1)
+    }
+}
+
+/// 设置页版本徽标的拼装规则：构建号是分辨「手里跑的是不是新版」的
+/// 唯一凭据（短版本号在多次构建间经常不变），两端都可能缺。
+final class AppVersionTextTests: XCTestCase {
+    func testVersionDisplayTextCombinations() {
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: "0.2.0", buildVersion: "23"), "0.2.0 (23)")
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: "0.2.0", buildVersion: nil), "0.2.0")
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: nil, buildVersion: "23"), "开发版 (23)")
+        XCTAssertEqual(AppVersionText.displayText(shortVersion: nil, buildVersion: nil), "开发版")
     }
 }

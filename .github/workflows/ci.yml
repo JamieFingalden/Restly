@@ -50,6 +50,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # build.sh 用 git rev-list --count 派生构建号，浅克隆（默认 depth=1）
+          # 会让 CI 里计数恒为 1、构建号退化——构建任务必须拉全量历史。
+          fetch-depth: 0
       - name: 构建安装包
         run: ./scripts/build.sh
       - name: 校验安装包

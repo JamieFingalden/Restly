@@ -16,7 +16,25 @@ fi
 
 echo "正在校验 Restly ${VERSION} 通用安装包…"
 plutil -lint "${INFO_PATH}"
-cmp "${PROJECT_DIR}/Support/Info.plist" "${INFO_PATH}"
+# 打包时 build.sh 会把包内 CFBundleVersion 改写为唯一构建号（git短哈希-时间戳），
+# 这是有意为之的差异：断言戳记形态正确，其余所有键转成 XML 后仍要求完全一致。
+STAMPED_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${INFO_PATH}")"
+[[ "${STAMPED_BUILD}" =~ ^[0-9]{1,4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]] || {
+    echo "包内 CFBundleVersion 不是合法的数字构建号（提交数.月日时分）：${STAMPED_BUILD}" >&2
+    exit 1
+}
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :RestlyBuildStamp' "${INFO_PATH}")" =~ ^[0-9a-f]{7,40}-[0-9]{8}$ ]] || {
+    echo "包内缺少 RestlyBuildStamp 诊断键。" >&2
+    exit 1
+}
+PLIST_CMP_DIR="$(mktemp -d /tmp/restly-plist.XXXXXX)"
+plutil -convert xml1 -o "${PLIST_CMP_DIR}/support.xml" "${PROJECT_DIR}/Support/Info.plist"
+plutil -convert xml1 -o "${PLIST_CMP_DIR}/packaged.xml" "${INFO_PATH}"
+/usr/libexec/PlistBuddy -c 'Delete :CFBundleVersion' "${PLIST_CMP_DIR}/support.xml"
+/usr/libexec/PlistBuddy -c 'Delete :CFBundleVersion' "${PLIST_CMP_DIR}/packaged.xml"
+/usr/libexec/PlistBuddy -c 'Delete :RestlyBuildStamp' "${PLIST_CMP_DIR}/packaged.xml"
+cmp "${PLIST_CMP_DIR}/support.xml" "${PLIST_CMP_DIR}/packaged.xml"
+rm -rf "${PLIST_CMP_DIR}"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${INFO_PATH}")" == "13.0" ]]
 [[ -x "${BINARY_PATH}" ]]
 for BINARY_ARCH in arm64 x86_64; do

@@ -90,7 +90,34 @@ final class ReminderSettings: ObservableObject {
         didSet { persist(pomodoroShowsInMenuBar, forKey: Keys.pomodoroShowsInMenuBar, change: .other) }
     }
 
+    /// 联动依赖的两条快捷指令的名字。名字是 Restly 调用它们的唯一凭据，
+    /// 而用户可能早就手动建过名字不同的两条（比如「设定专注模式」）——
+    /// 与其逼人重建，不如让设置迁就现状。落盘规则见 storeShortcutName。
+    @Published var focusLinkOnShortcutName: String {
+        didSet { storeShortcutName(focusLinkOnShortcutName, key: Keys.focusLinkOnShortcutName) }
+    }
+
+    @Published var focusLinkOffShortcutName: String {
+        didSet { storeShortcutName(focusLinkOffShortcutName, key: Keys.focusLinkOffShortcutName) }
+    }
+
+    /// 与 macOS 专注模式联动。默认关闭 —— 依赖用户自己装的两条快捷指令，
+    /// 没装就打开只会让 PomodoroManager 每次转段都白跑进程。
+    @Published var pomodoroLinksFocusMode: Bool {
+        didSet {
+            persist(pomodoroLinksFocusMode, forKey: Keys.pomodoroLinksFocusMode, change: .other)
+            // 联动开关翻转要立刻反映到专注模式上（中途关掉得恢复原状）。
+            // 走独立回调而不挤进 onChange：那是单槽属性、已由
+            // ReminderManager 占用，为这一个开关改成广播数组不值得。
+            guard !isLoading else { return }
+            onLinksFocusModeChange?()
+        }
+    }
+
     var onChange: ((SettingsChange) -> Void)?
+
+    /// 联动开关翻转的通知，由 PomodoroManager 接线（组合根风格，同 onChange）。
+    var onLinksFocusModeChange: (() -> Void)?
 
     private let defaults: UserDefaults
     private var isLoading = true
@@ -114,6 +141,12 @@ final class ReminderSettings: ObservableObject {
         pomodoroAutoStartBreak = defaults.object(forKey: Keys.pomodoroAutoStartBreak) as? Bool ?? true
         pomodoroAutoStartFocus = defaults.object(forKey: Keys.pomodoroAutoStartFocus) as? Bool ?? false
         pomodoroShowsInMenuBar = defaults.object(forKey: Keys.pomodoroShowsInMenuBar) as? Bool ?? true
+        // 缺键读成空串：空 = 跟随默认（resolved* 的取值口径），
+        // 输入框用占位符把默认名亮出来。读成默认名会让「跟随默认」
+        // 和「用户真的指认了默认名」在存档里无法区分。
+        focusLinkOnShortcutName = defaults.string(forKey: Keys.focusLinkOnShortcutName) ?? ""
+        focusLinkOffShortcutName = defaults.string(forKey: Keys.focusLinkOffShortcutName) ?? ""
+        pomodoroLinksFocusMode = defaults.object(forKey: Keys.pomodoroLinksFocusMode) as? Bool ?? false
         isLoading = false
     }
 
@@ -157,5 +190,39 @@ final class ReminderSettings: ObservableObject {
         static let pomodoroAutoStartBreak = "pomodoroAutoStartBreak"
         static let pomodoroAutoStartFocus = "pomodoroAutoStartFocus"
         static let pomodoroShowsInMenuBar = "pomodoroShowsInMenuBar"
+        static let pomodoroLinksFocusMode = "pomodoroLinksFocusMode"
+        static let focusLinkOnShortcutName = "focusLinkOnShortcutName"
+        static let focusLinkOffShortcutName = "focusLinkOffShortcutName"
+    }
+
+    // MARK: - 联动名字的取值口径
+
+    /// 实际生效的名字：去首尾空白，清空则回退出厂默认 ——
+    /// 输入框被清空不该让联动去找一条空名字的指令。
+    var resolvedFocusLinkOnName: String {
+        resolvedShortcutName(focusLinkOnShortcutName, fallback: FocusModeBridge.defaultOnShortcutName)
+    }
+
+    var resolvedFocusLinkOffName: String {
+        resolvedShortcutName(focusLinkOffShortcutName, fallback: FocusModeBridge.defaultOffShortcutName)
+    }
+
+    private func resolvedShortcutName(_ name: String, fallback: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    /// 名字指认的落盘规则：输入了内容才存（去首尾空白），清空 = 删键
+    /// 回退默认。默认值绝不伪装成用户指认写进存档 —— 曾有用户发现
+    /// 自己指认的名字「自己变回了默认」，存档里躺着的正是默认名。
+    private func storeShortcutName(_ value: String, key: String) {
+        guard !isLoading else { return }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(trimmed, forKey: key)
+        }
+        onChange?(.other)
     }
 }
