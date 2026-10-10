@@ -204,6 +204,11 @@ final class FocusModeBridge: ObservableObject {
     /// `explicitNames` 供名字转场用：对「旧对」执行关闭时要把指令
     /// 打到旧名字上，而不是当前指认的新名字。
     ///
+    /// 无显式指名的关闭同样打到「已应用对」（appliedNames）上：
+    /// 改名中间态下现值可能不存在，但专注是被旧对开启的 —— 对着
+    /// 新名字发关闭只会失败，旧模式被留在开启状态且无法经 app
+    /// 恢复（转场只在就绪结算，中间态恰恰没有转场兜底）。
+    ///
     /// `recordsAppliedNames = false` 是转场专用的记账豁免：转场旧关
     /// 若把 appliedNames 写回旧对，新开启失败时结算会看到
     /// 「applied(旧) ≠ 生效(新)」再次触发转场 —— 旧关新开无限循环、
@@ -214,8 +219,25 @@ final class FocusModeBridge: ObservableObject {
         with explicitNames: ShortcutNames? = nil,
         recordsAppliedNames: Bool = true
     ) async -> Result<Void, LinkageError> {
-        guard !isMissing else { return .failure(.missing) }
-        let currentNames = explicitNames ?? names
+        let currentNames: ShortcutNames
+        if let explicitNames {
+            currentNames = explicitNames
+        } else if !engaged, let applied = appliedNames {
+            currentNames = applied
+        } else {
+            currentNames = names
+        }
+        // 同名对无效：一条指令没法独立承担开与关（开着的东西关不掉），
+        // 检测与一键创建同样拒绝 —— 执行层不把它当可用配置记账。
+        guard currentNames.on != currentNames.off else {
+            return .failure(.missing)
+        }
+        // 熔断只拦「现值对」：它是「当前指认的两条缺失」的结论，管
+        // 不到显式转场的旧对（转场只在就绪结算后发生，彼时熔断已被
+        // 复位）与已应用旧对（现值缺失不说明旧对不在场）。
+        if isMissing, currentNames == names {
+            return .failure(.missing)
+        }
         let name = engaged ? currentNames.on : currentNames.off
         let (status, output) = await run(["run", name])
         guard status == 0 else {
@@ -240,6 +262,15 @@ final class FocusModeBridge: ObservableObject {
     /// 确认轮询用，那里要的就是绕过缓存的新答案。
     func checkShortcutsExist(forceRefresh: Bool = false) async -> Existence {
         let currentNames = names
+        // 同名对就绪检查：一条指令无法独立承担开与关，同名即未就绪
+        // —— 名字在场也改变不了结论，不白跑 list；结论照常入缓存与
+        // 发布状态，设置层的同名黄牌负责指路。
+        if currentNames.on == currentNames.off {
+            existenceCache = (currentNames, .missing, Date())
+            recordExistence(.missing)
+            DebugEventLog.shared.log("联动检查：开启/关闭指认同名「\(currentNames.on)」，视为未就绪")
+            return .missing
+        }
         if !forceRefresh, let cache = existenceCache,
            cache.names == currentNames,
            Date().timeIntervalSince(cache.timestamp) < existenceCacheTTL {
@@ -312,7 +343,9 @@ final class FocusModeBridge: ObservableObject {
     }
 
     func launchOffShortcutSynchronously(named explicit: ShortcutNames? = nil) {
-        let currentNames = explicit ?? names
+        // 退出关闭指向已应用对（无显式指名时）：改名中间态下现值
+        // off 可能不存在，真正开着的是旧对。
+        let currentNames = explicit ?? appliedNames ?? names
         // 保序：先等在飞的 run 结算（有界 5 秒），再拉同步关闭 ——
         // 关闭与慢 enable 赛跑输了的话，退出后专注模式仍开着。
         waitForInFlightRuns(timeout: 5)
@@ -340,6 +373,12 @@ final class FocusModeBridge: ObservableObject {
     /// 用户点不点「添加快捷指令」只有系统知道，这里不猜。
     func installShortcuts() async -> InstallOutcome {
         let currentNames = names
+        guard currentNames.on != currentNames.off else {
+            // 同名指认拒绝：两个同名文件会互相覆盖、同一文件开两次，
+            // 装出来的联动无法独立开/关 —— 零副作用退出，理由带回去。
+            DebugEventLog.shared.log("联动安装：开启/关闭指认同名「\(currentNames.on)」，拒绝生成")
+            return .generationFailed("开启与关闭指令不能同名：请修改其中一个名字")
+        }
         DebugEventLog.shared.log("联动安装：进入（目标「\(currentNames.on)」「\(currentNames.off)」）")
         sweepStaleTemporaryDirectories()
         let files: [URL]

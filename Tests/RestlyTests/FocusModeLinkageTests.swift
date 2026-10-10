@@ -1659,6 +1659,195 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertEqual(failureBox.status, -1)
     }
 
+    // MARK: - 关闭指向已应用对（codex/Grove 十一轮 ①）
+
+    /// 专注开启后用户把指认改成不存在的中间态：暂停/停止的关闭必须
+    /// 打到已应用的旧对上 —— 对着新名字发关闭只会失败，旧对开启的
+    /// 专注模式被留在开启状态且无法经 app 恢复（转场只在就绪结算，
+    /// 中间态恰恰没有转场兜底）。
+    @MainActor
+    func testDisengageTargetsAppliedPairWhenNamesEditedToMissing() async {
+        var names = FocusModeBridge.ShortcutNames(on: "旧开", off: "旧关")
+        let stub = RunnerStub(responses: [
+            (0, ""),   // 旧对开启
+            (0, ""),   // 关闭也应打到旧对
+        ])
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { names },
+            focusTargetProvider: { nil }
+        )
+
+        let engageResult = await bridge.setFocusEngaged(true)
+        guard case .success = engageResult else {
+            return XCTFail("旧对开启应当成功，实际 \(engageResult)")
+        }
+        XCTAssertEqual(bridge.appliedNames, .init(on: "旧开", off: "旧关"))
+
+        // 改名中间态：新对不存在（list 都不用跑 —— 关闭不该碰新名字）。
+        names = .init(on: "打字中开", off: "打字中关")
+        let disengageResult = await bridge.setFocusEngaged(false)
+
+        guard case .success = disengageResult else {
+            return XCTFail("旧对关闭应当成功，实际 \(disengageResult)")
+        }
+        XCTAssertEqual(
+            runCalls(in: stub).map(\.name),
+            ["旧开", "旧关"],
+            "关闭必须指向已应用的旧对，而不是改名后的现值"
+        )
+    }
+
+    /// 同场景的退出面：willTerminate 的同步关闭也要指向已应用旧对。
+    @MainActor
+    func testTerminateOffTargetsAppliedPairWhenNamesEditedToMissing() async {
+        var names = FocusModeBridge.ShortcutNames(on: "旧开", off: "旧关")
+        let stub = RunnerStub(responses: [(0, "")])   // 旧对开启
+        let recorder = SyncLaunchRecorder()
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { names },
+            focusTargetProvider: { nil },
+            synchronousLauncher: { try recorder.record($0) }
+        )
+
+        _ = await bridge.setFocusEngaged(true)
+        names = .init(on: "打字中开", off: "打字中关")
+
+        bridge.launchOffShortcutSynchronously()
+
+        XCTAssertEqual(
+            recorder.argvList.first,
+            ["/usr/bin/shortcuts", "run", "旧关"],
+            "退出关闭必须指向已应用的旧对"
+        )
+    }
+
+    /// 熔断不拦旧对关闭：熔断是「现值对缺失」的结论。改名后现值
+    /// run 失败挂了熔断，下一次暂停仍要能把旧对关掉 —— 否则专注
+    /// 只能等重启才关得上。
+    @MainActor
+    func testDisengageOfAppliedPairBypassesMissingFuse() async {
+        var names = FocusModeBridge.ShortcutNames(on: "旧开", off: "旧关")
+        let stub = RunnerStub(responses: [
+            (0, ""),                    // 旧对开启
+            (1, "找不到快捷指令"),        // 现值新开失败（挂熔断）
+            (0, ""),                    // 定性 list：空名单 → missing
+            (0, ""),                    // 旧对关闭成功
+        ])
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { names },
+            focusTargetProvider: { nil }
+        )
+
+        _ = await bridge.setFocusEngaged(true)
+        names = .init(on: "打字中开", off: "打字中关")
+        // 对现值的执行失败 → 存在性定性 missing → 熔断挂起。
+        let missingResult = await bridge.setFocusEngaged(true)
+        guard case .failure(.missing) = missingResult else {
+            return XCTFail("现值执行失败应定性 missing，实际 \(missingResult)")
+        }
+        XCTAssertTrue(bridge.isMissing)
+
+        let disengageResult = await bridge.setFocusEngaged(false)
+        guard case .success = disengageResult else {
+            return XCTFail("旧对关闭不应被熔断拦截，实际 \(disengageResult)")
+        }
+        XCTAssertEqual(
+            runCalls(in: stub).map(\.name),
+            ["旧开", "打字中开", "旧关"],
+            "熔断拦的是现值对，已应用旧对的关闭照发"
+        )
+    }
+
+    // MARK: - 同名拒绝（codex/Grove 十一轮 ②）
+
+    /// 开/关指认同一条（在场）指令：Set 去重不再误报就绪 ——
+    /// 一条指令无法独立承担开与关。结论与名单无关，不白跑 list。
+    @MainActor
+    func testIdenticalOnOffNamesReportMissingNotReady() async {
+        let stub = RunnerStub()
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { .init(on: "同一条", off: "同一条") },
+            focusTargetProvider: { nil }
+        )
+
+        let existence = await bridge.checkShortcutsExist(forceRefresh: true)
+
+        XCTAssertEqual(existence, .missing, "同名对不得报就绪")
+        XCTAssertEqual(bridge.lastKnownExistence, .missing)
+        XCTAssertEqual(stub.invocations.filter { $0.command == "list" }.count, 0, "不白跑 list")
+
+        // 结论入缓存：TTL 内复查零进程。
+        let cached = await bridge.checkShortcutsExist()
+        XCTAssertEqual(cached, .missing)
+        XCTAssertEqual(stub.invocations.count, 0)
+    }
+
+    /// 一键创建对同名指认零副作用拒绝：不生成文件、不签名、不拉
+    /// App、不打开 —— 否则两个同名文件互相覆盖、同一文件开两次。
+    @MainActor
+    func testInstallRefusesIdenticalNamesBeforeAnySideEffects() async {
+        let stub = RunnerStub()
+        let wake = AppWakeCounter()
+        var openedCount = 0
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { .init(on: "同一条", off: "同一条") },
+            focusTargetProvider: {
+                FocusModeBridge.FocusTarget(identifier: "com.apple.donotdisturb.mode.default", displayName: "Do Not Disturb")
+            },
+            openHandler: { _ in
+                openedCount += 1
+                return true
+            },
+            interOpenDelay: 0,
+            ensureAppRunning: { wake.record() }
+        )
+
+        let outcome = await bridge.installShortcuts()
+
+        guard case .generationFailed(let reason) = outcome else {
+            return XCTFail("同名指认应当拒绝生成，实际 \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("同名"), "拒绝理由要点明同名：\(reason)")
+        XCTAssertEqual(stub.invocations.count, 0, "零进程：不生成不签名")
+        XCTAssertEqual(wake.count, 0, "不拉快捷指令 App")
+        XCTAssertEqual(openedCount, 0, "不打开任何文件")
+    }
+
+    /// 执行层同样拒绝同名对：宁可 .missing 也不把「开着的东西关不掉」
+    /// 的配置当成功记账。
+    @MainActor
+    func testSetFocusEngagedRefusesIdenticalNames() async {
+        let stub = RunnerStub()
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { .init(on: "同一条", off: "同一条") },
+            focusTargetProvider: { nil }
+        )
+
+        let result = await bridge.setFocusEngaged(true)
+
+        guard case .failure(.missing) = result else {
+            return XCTFail("同名对应拒绝执行，实际 \(result)")
+        }
+        XCTAssertEqual(runCalls(in: stub).count, 0, "同名对不得起进程")
+    }
+
+    /// 同名黄牌契约：设置层在名字区下亮橙牌指路，执行/检测/创建
+    /// 三层再各兜一道（防御纵深）。
+    func testShortcutNamesConflictDetection() {
+        XCTAssertTrue(SettingsView.shortcutNamesConflict(on: "同一条", off: "同一条"))
+        XCTAssertFalse(SettingsView.shortcutNamesConflict(on: "开", off: "关"))
+        XCTAssertFalse(
+            SettingsView.shortcutNamesConflict(on: "A", off: "a"),
+            "名字须与快捷指令 App 完全一致，大小写不同是两条指令，不算冲突"
+        )
+    }
+
     /// 配置文件读不到/解析失败/为空都不得让一键创建死掉：
     /// 静态勿扰兜底（identifier 全系统恒定）+ 黑匣子记下原因。
     /// 实测同一构建终端启动读得到、open 启动被拒（打包身份漂移），

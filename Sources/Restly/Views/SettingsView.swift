@@ -242,6 +242,17 @@ struct SettingsView: View {
                         set: { settings.focusLinkOffShortcutName = $0 }
                     )
                 )
+                if Self.shortcutNamesConflict(
+                    on: settings.resolvedFocusLinkOnName,
+                    off: settings.resolvedFocusLinkOffName
+                ) {
+                    Label(
+                        "开启与关闭指令不能指认同一条快捷指令，请修改其中一个名字。",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundStyle(.orange)
+                }
                 HStack(spacing: 6) {
                     Button("从已有快捷指令中选择") { loadAvailableShortcutNames(force: false) }
                         .font(.system(size: 11.5, weight: .medium, design: .rounded))
@@ -408,6 +419,14 @@ struct SettingsView: View {
         autoGuide: Bool
     ) -> Bool {
         isLinkageEnabled && autoGuide && existence != .ready
+    }
+
+    /// 同名拒绝契约：开启/关闭指认同一条指令时，联动无法独立地
+    /// 开/关专注模式 —— 设置层在名字区下亮黄牌指路，检测与一键
+    /// 创建在 bridge 再各兜一道（防御纵深，别只靠 UI）。名字须与
+    /// 快捷指令 App 完全一致，比较即大小写敏感。
+    static func shortcutNamesConflict(on: String, off: String) -> Bool {
+        on == off
     }
 
     private func refreshLinkageStatusIfEnabled(force: Bool = false) {
