@@ -22,24 +22,31 @@ final class FocusModeLinkageTests: XCTestCase {
         private(set) var invocations: [Invocation] = []
         /// 按次出队的应答；耗尽后走默认成功应答。
         private var responses: [(status: Int32, output: String)] = []
-        /// 挂住 run 命令不回结果（模拟 enable 在飞）。
+        /// 挂住所有 run 命令不回结果（模拟 enable 在飞）。
         private let holdRuns: Bool
+        /// 只挂第一条 run（模拟最老的开启指令慢于后续所有操作）。
+        private let holdFirstRun: Bool
         private let heldLock = NSLock()
-        private var heldCompletions: [@Sendable () -> Void] = []
-        /// 释放所有挂起的 run（模拟慢 enable 终于跑完）。
-        func releaseHeldRuns() {
+        private var heldCompletions: [@Sendable (Int32, String) -> Void] = []
+        /// 释放所有挂起的 run（模拟慢 enable 终于跑完），可指定结果。
+        func releaseHeldRuns(status: Int32 = 0, output: String = "") {
             heldLock.lock()
             let pending = heldCompletions
             heldCompletions = []
             heldLock.unlock()
-            pending.forEach { $0() }
+            pending.forEach { $0(status, output) }
         }
         /// 每次 sign 调用前回调（序号从 0 起），供测试在精确时机取消。
         var signGate: ((Int) -> Void)?
 
-        init(responses: [(Int32, String)] = [], holdRuns: Bool = false) {
+        init(
+            responses: [(Int32, String)] = [],
+            holdRuns: Bool = false,
+            holdFirstRun: Bool = false
+        ) {
             self.responses = responses
             self.holdRuns = holdRuns
+            self.holdFirstRun = holdFirstRun
         }
 
         var runner: FocusModeBridge.ProcessRunner {
@@ -51,14 +58,19 @@ final class FocusModeLinkageTests: XCTestCase {
                     name: rest.count > 1 ? rest[1] : "",
                     argv: rest
                 ))
-                if holdRuns, rest.first == "run" {
+                let isRun = rest.first == "run"
+                let isFirstRun = isRun
+                    && invocations.filter { $0.command == "run" }.count == 1
+                if isRun, holdRuns || (holdFirstRun && isFirstRun) {
                     // 挂起：子进程退出信号与完成回调一起存起来，
                     // 等 releaseHeldRuns 按序触发。
                     heldLock.lock()
-                    heldCompletions.append { [onProcessExit, completion] in
+                    // 挂起条目转发释放时给定的结果（失败回滚测试要用）。
+                    let entry: @Sendable (Int32, String) -> Void = { [onProcessExit, completion] status, output in
                         onProcessExit()
-                        completion(0, "")
+                        completion(status, output)
                     }
+                    heldCompletions.append(entry)
                     heldLock.unlock()
                     return
                 }
@@ -1214,6 +1226,121 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertTrue(reason.contains("本地化名称"), "原因要写明症结：\(reason)")
         XCTAssertTrue(reason.contains("手动创建"), "原因要给出路：\(reason)")
         XCTAssertTrue(opened.isEmpty, "生成失败不得打开任何文件")
+    }
+
+    // MARK: - 代数账本（codex 八轮 ②③）
+
+    /// ③ 过期失败回滚晚到，不得覆盖新成功状态：
+    /// 开始（gen1 挂起）→ 暂停（gen2 off 完成）→ 恢复（gen3 开启完成）
+    /// → 此时才释放 gen1 的失败结果：回滚必须被代数门拦下，
+    /// applied 保持 true（系统实际开着，账本不能记成关）。
+    @MainActor
+    func testStaleFailureRollbackDoesNotClobberNewerSuccess() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        // gen1 的失败结果（含定性 list）延迟到 gen3 之后才释放。
+        let stub = RunnerStub(holdFirstRun: true)
+        let bridge = makeBridge(runner: stub.runner)
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        XCTAssertEqual(manager.linkGeneration, 1)
+        XCTAssertTrue(manager.isFocusLinkApplied, "开启乐观记账")
+
+        manager.pause()
+        await drain()
+        XCTAssertEqual(manager.linkGeneration, 2)
+        // holdFirstRun 只挂最老的开启：off 正常完成，applied 落到 false。
+        XCTAssertFalse(manager.isFocusLinkApplied)
+        XCTAssertEqual(manager.pendingOffCount, 0)
+
+        manager.resume()
+        await drain()
+        XCTAssertEqual(manager.linkGeneration, 3)
+        XCTAssertTrue(manager.isFocusLinkApplied)
+        XCTAssertEqual(manager.pendingOffCount, 0)
+
+        // 现在才让 gen1 的失败结果晚到。
+        stub.releaseHeldRuns(status: 1, output: "找不到快捷指令")
+        await drain()
+
+        XCTAssertEqual(manager.linkGeneration, 3, "过期回调不得推进代数")
+        XCTAssertTrue(
+            manager.isFocusLinkApplied,
+            "过期失败回滚无权写账本：系统实际开着，账本不能被写回关"
+        )
+        XCTAssertEqual(manager.pendingOffCount, 0)
+        XCTAssertFalse(
+            manager.hasShownFocusLinkageWarning,
+            "过期回调连缺失提醒都不该弹（那是新一代指令路径的事）"
+        )
+    }
+
+    /// ② off 排队未拉起时 terminate：同步关闭必须仍然发生，
+    /// 且记账清零（排队的 off 随进程消亡也不留悬账）。
+    @MainActor
+    func testTerminateDuringPendingOffStillFiresSyncClose() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(holdRuns: true)   // 开启与关闭都挂住
+        let recorder = SyncLaunchRecorder()
+        let bridge = makeBridge(runner: stub.runner, syncLaunchRecorder: recorder)
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        XCTAssertTrue(manager.isFocusLinkApplied, "开启乐观记账（子进程还没退出）")
+
+        manager.pause()
+        XCTAssertEqual(manager.pendingOffCount, 1, "off 已提交未拉起")
+        XCTAssertTrue(manager.isFocusLinkApplied, "off 未拉起前 applied 保持 true")
+
+        manager.handleAppWillTerminate()
+
+        XCTAssertEqual(
+            recorder.argvList.first,
+            ["/usr/bin/shortcuts", "run", "Restly 专注关闭"],
+            "pendingOff 未拉起时退出必须补发同步关闭"
+        )
+        XCTAssertEqual(manager.pendingOffCount, 0)
+        XCTAssertFalse(manager.isFocusLinkApplied)
+    }
+
+    /// 代数只拦过期回调：最新一代的失败回滚必须照常生效，
+    /// 防止矫枉过正把正常回滚也废了。
+    @MainActor
+    func testLatestGenerationFailureRollbackStillApplies() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(responses: [
+            (1, "找不到快捷指令"),   // 恢复（最新一代）开启失败
+            (0, ""),                // 定性 list：missing
+        ])
+        let bridge = makeBridge(runner: stub.runner)
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        XCTAssertFalse(manager.isFocusLinkApplied, "gen1 开启已失败并回滚")
+
+        manager.pause()
+        await drain()
+        XCTAssertFalse(manager.isFocusLinkApplied, "本来就没开，暂停不改变账本")
+        XCTAssertEqual(manager.pendingOffCount, 0, "applied 已是关，暂停不再重复发 off")
+
+        manager.resume()
+        await drain()
+
+        XCTAssertFalse(
+            manager.isFocusLinkApplied,
+            "最新一代的失败回滚要照常生效（系统实际没开，账本不能记开）"
+        )
+        XCTAssertTrue(bridge.isMissing)
+        XCTAssertTrue(manager.hasShownFocusLinkageWarning)
     }
 
     // MARK: - 名字转场（codex 六轮 ③）

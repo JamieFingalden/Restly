@@ -40,13 +40,23 @@ final class PomodoroManager: ObservableObject {
     var onRequestOpenSettings: (() -> Void)?
 
     /// 期望联动态：上一轮结算按「设置开 && 专注段计时中」算出的值。
-    private var isFocusLinkDesired = false
+    /// 期望联动态：上一轮结算按「设置开 && 专注段计时中」算出的值。
+    private(set) var isFocusLinkDesired = false
     /// 已成功应用的联动态：只有 setFocusEngaged 真正成功才推进。
     /// 失败（缺失熔断等）时保持原值，让 diff 持续看到「想要但没办到」，
     /// 熔断复位钩子（bridge.onMissingCleared → syncFocusLinkage）或
     /// 下一次流转会把这笔账补上 —— 用户在专注中途装好指令的场景
     /// 就靠它把本段专注补进联动，否则要拖到下一段。
-    private var isFocusLinkApplied = false
+    /// 已应用联动态。开启乐观置位（指令发起即记账，失败按代数回滚）；
+    /// 关闭不乐观置 false —— 改记 pendingOffCount，见 syncFocusLinkage。
+    private(set) var isFocusLinkApplied = false
+    /// 已提交但尚未确认子进程退出的关闭指令数。> 0 时退出必须补发
+    /// 同步关闭（排队的 off 会随进程消亡，先前的开启却已生效）。
+    private(set) var pendingOffCount = 0
+    /// 联动操作代数：每次提交先取号；回调恢复时与最新代数比对，
+    /// 过期回调只记黑匣子、无权写账本（慢失败回滚踩掉新成功状态、
+    /// 旧关闭回滚盖掉新开启，都是没这道闸才可能）。
+    private(set) var linkGeneration = 0
     /// 缺失提醒每次启动最多一条：连打几颗番茄都失败时，第 2 条起就是噪音。
     private(set) var hasShownFocusLinkageWarning = false
 
@@ -356,29 +366,57 @@ final class PomodoroManager: ObservableObject {
         guard shouldEngage != isFocusLinkDesired || shouldEngage != isFocusLinkApplied else { return }
         isFocusLinkDesired = shouldEngage
 
-        // 快捷指令是异步进程，发出去就不管。两个 Task 的提交与完成
-        // 都按主线程调度顺序串行，applied 最终等于最后一条成功指令。
+        // 代数取号：每次提交一条指令就前进一代。回调恢复时比对，
+        // 过期回调只记黑匣子、无权写账本。
+        linkGeneration += 1
+        let generation = linkGeneration
         let bridge = focusModeBridge
         let engaged = shouldEngage
+        if engaged {
+            // 开启乐观置位：指令已发起（哪怕结果未回）就按已应用记账
+            // ——「刚开专注就退出 app」时 willTerminate 若按「结果回
+            // 没回」判定会跳过关闭，enable 却在退出后跑完，专注模式
+            // 被留开。失败按代数回滚，下一轮结算自然重试。
+            isFocusLinkApplied = true
+        } else {
+            // 关闭不乐观置 false：off 排在慢 enable 后面时，提前置
+            // false 会让退出守卫漏发同步关闭（排队 off 随进程消亡、
+            // 先前开启已生效 → 专注留开）。改记 pendingOff，直到回调
+            // 确认子进程已退出（过期回调也递减：这是进程生命周期
+            // 记账，不是状态写入）。
+            pendingOffCount += 1
+        }
         Task { @MainActor in
-            // 乐观置位：指令已发起（哪怕结果未回）就按已应用记账 ——
-            // 「刚开专注就退出 app」的场景里，若按「结果回没回」判定，
-            // willTerminate 会因 applied=false 跳过关闭，enable 却在
-            // 退出后跑完，专注模式被留开。关闭指令幂等（对未开启的
-            // 模式执行关闭无害），宁可多发不可漏发；失败在此回滚，
-            // 下一轮结算自然重试。
-            self.isFocusLinkApplied = engaged
             let result = await bridge.setFocusEngaged(engaged)
+            // pendingOff 递减不受代数限制：子进程确实退出过一次。
+            if !engaged, pendingOffCount > 0 { pendingOffCount -= 1 }
+            guard generation == linkGeneration else {
+                // 过期回调：这条指令的结果已经被更新的指令覆盖，
+                // 回滚/推进都会把账本写回旧态（系统实际开着、账本记
+                // 着关 → 退出清理被跳过）。只记黑匣子。
+                DebugEventLog.shared.log(
+                    "联动账本：过期回调 gen \(generation)（最新 \(linkGeneration)），不写账"
+                )
+                return
+            }
             switch result {
             case .success(()):
-                break  // 已记账，落袋。
+                isFocusLinkApplied = engaged
             case .failure(.missing):
-                self.isFocusLinkApplied = !engaged
-                self.presentFocusLinkageMissingToast()
+                // missing = 指令根本没跑（熔断短路或名单确认缺失），
+                // 无论开还是关，诚实的账本都是「未应用」——若此前真
+                // 开着，残留由 isMissing 路由到重建流程收敛。
+                isFocusLinkApplied = false
+                presentFocusLinkageMissingToast()
             case .failure(.failed), .failure(.noFocusTarget):
-                self.isFocusLinkApplied = !engaged
-                // 其它失败 bridge 已留痕：不动状态、不弹框，
-                // 下一次结算（流转或复位钩子）自然会重试。
+                // 指令真的跑了但失败：开失败=没开上（回 false），
+                // 关失败=可能还开着（保持 true）。下一轮结算重试。
+                isFocusLinkApplied = !engaged
+            }
+            // 关闭落定后若期望已翻回开启（暂停后立刻恢复）：补一次
+            // 结算重开 —— applied 此时已是 false，diff 会重新开。
+            if !engaged, isFocusLinkDesired {
+                syncFocusLinkage()
             }
         }
     }
@@ -407,21 +445,44 @@ final class PomodoroManager: ObservableObject {
     /// 否则暂停/退出会拿新对执行关闭，旧模式被留在开启状态。
     /// Task 提交顺序即子进程队列顺序：旧关先于新开。
     func handleAppliedNamesTransition(from oldNames: FocusModeBridge.ShortcutNames) {
+        // 旧对关闭单独取一代：它的回调若晚于后续新对开结算，代数门
+        // 会拦下（旧对的失败回滚不得覆盖新对的状态）。
+        linkGeneration += 1
+        let generation = linkGeneration
+        pendingOffCount += 1
+
         let bridge = focusModeBridge
         Task { @MainActor in
-            _ = await bridge.setFocusEngaged(false, with: oldNames)
+            let result = await bridge.setFocusEngaged(false, with: oldNames)
+            if pendingOffCount > 0 { pendingOffCount -= 1 }
+            guard generation == linkGeneration else {
+                DebugEventLog.shared.log(
+                    "联动账本：转场旧关过期回调 gen \(generation)（最新 \(linkGeneration)），不写账"
+                )
+                return
+            }
+            if case .failure(let error) = result {
+                NSLog("Restly 名字转场关闭旧对失败：\(error)")
+            }
+            isFocusLinkApplied = false
+            syncFocusLinkage()
         }
+        // 应用态先归零：sync 的 diff 会看到「期望开着、还没应用」，
+        // 计时中就重开新对；未计时则只当旧对收尾。
         isFocusLinkApplied = false
         syncFocusLinkage()
     }
 
     func handleAppWillTerminate() {
-        // applied 是乐观记账：指令发起即置位（见 syncFocusLinkage），
-        // 所以「刚开专注就退出」的在飞开启也会走到这里。关闭指令
-        // 幂等，宁可多发不可漏发。
-        guard isFocusLinkApplied else { return }
+        // 三条件任一为真都补发同步关闭（幂等，宁可多发不可漏发）：
+        // desired —— 结算判定要开但指令还没提交；
+        // applied —— 开启已确认/乐观记账（含在飞开启）；
+        // pendingOffCount —— 有排队的关闭还没确认拉起，随进程消亡
+        // 的话先前的开启会把专注留开（round 15 问题 ②）。
+        guard isFocusLinkDesired || isFocusLinkApplied || pendingOffCount > 0 else { return }
         isFocusLinkDesired = false
         isFocusLinkApplied = false
+        pendingOffCount = 0
         // 退出路径必须同步把子进程拉起来：Task 排队的话，主 actor
         // 回调一返回进程就可能退出，Task 根本没轮到执行，专注模式
         // 被留在开着的状态。Process.run() 只负责拉起（不等待退出），
