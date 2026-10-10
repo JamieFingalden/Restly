@@ -28,6 +28,9 @@ struct SettingsView: View {
     /// 名字结算的防抖任务与「上次已结算值」（submit+blur 连击去重）。
     @State private var nameSettleTask: Task<Void, Never>?
     @State private var lastSettledNames: (on: String, off: String)?
+    /// 联动状态检查被占用时挂起的补跑标记（在飞检查吞掉改名刷新的
+    /// 教训：占用不丢弃请求）。
+    @State private var hasPendingLinkageRefresh = false
     /// 名字结算的防抖窗口：连续击键只在停顿后结算一次。
     static let nameSettleDebounce: Duration = .milliseconds(400)
 
@@ -255,9 +258,9 @@ struct SettingsView: View {
     }
 
     /// 名字指认变化（下拉选择、手输提交或失焦）后的统一结算：强制
-    /// 重检就绪状态 —— 检测给出 .ready 时 bridge 复位熔断并触发
-    /// onMissingCleared，manager 随即补执行当前段的联动，不用等用户
-    /// 另行刷新或重启。
+    /// 重检就绪状态 —— 检测给出 .ready 时 bridge 复位熔断、前移
+    /// appliedNames 并触发转场（旧关新开），不用等用户另行刷新或
+    /// 重启；missing/unknown 则什么都不动（转场门控在 bridge）。
     ///
     /// 防抖与去重：连续击键只在停顿后结算一次；「submit 后紧跟的
     /// blur」与「值没变的重复 blur」靠 shortcutNameSettleNeeded 的
@@ -277,8 +280,14 @@ struct SettingsView: View {
                 off: settings.resolvedFocusLinkOffName
             )
             guard Self.shortcutNameSettleNeeded(current: settled, lastSettled: lastSettledNames) else { return }
-            lastSettledNames = settled
-            await refreshLinkageStatus(force: true)
+            // 记账挪到「检查被接受」之后：占用挂起（willCheck=true，
+            // 补跑会带着这次的名字去查）也算被服务；被拒则不记账，
+            // 值保留待下次结算 —— 否则改名刷新被在飞检查吞掉后，
+            // 去重会让新名字永远不再结算。
+            let willCheck = await refreshLinkageStatus(force: true)
+            if let bookkeeping = Self.settleBookkeeping(willCheck: willCheck, settled: settled) {
+                lastSettledNames = bookkeeping
+            }
         }
     }
 
@@ -290,6 +299,20 @@ struct SettingsView: View {
     ) -> Bool {
         guard let lastSettled else { return true }
         return current != lastSettled
+    }
+
+    /// 占用决策契约：已有检查在飞时新请求不丢弃，挂起补跑一次。
+    static func linkageRefreshQueuesWhenBusy(isChecking: Bool) -> Bool {
+        isChecking
+    }
+
+    /// 结算记账时机契约：检查被接受（立即发起或挂起补跑）才记
+    /// lastSettledNames；被拒（联动已关）不记，值保留待下次结算。
+    static func settleBookkeeping(
+        willCheck: Bool,
+        settled: (on: String, off: String)
+    ) -> (on: String, off: String)? {
+        willCheck ? settled : nil
     }
 
     private func shortcutNameRow(
@@ -341,12 +364,28 @@ struct SettingsView: View {
         }
     }
 
-    private func refreshLinkageStatus(force: Bool = false, autoGuideOnMissing: Bool = false) async {
-        guard settings.pomodoroLinksFocusMode else { return }
-        guard !isCheckingLinkage else { return }
+    /// 返回是否已有检查为这次请求服务（立即发起，或占用挂起待补跑）。
+    /// false 仅当联动已关闭。占用不丢弃请求 —— 在飞检查吞掉改名刷新、
+    /// 去重又拦住后续结算的连锁 bug 缺的就是这个挂起。
+    @discardableResult
+    private func refreshLinkageStatus(force: Bool = false, autoGuideOnMissing: Bool = false) async -> Bool {
+        guard settings.pomodoroLinksFocusMode else { return false }
+        if Self.linkageRefreshQueuesWhenBusy(isChecking: isCheckingLinkage) {
+            // 在飞检查吞掉改名刷新的教训：占用时不丢弃，挂起补跑一次。
+            hasPendingLinkageRefresh = true
+            return true
+        }
         isCheckingLinkage = true
         let existence = await focusModeBridge.checkShortcutsExist(forceRefresh: force)
         isCheckingLinkage = false
+
+        // 在飞期间发生过改名/开关变化：补跑一次（补跑期间再变化会
+        // 再次挂起，最终收敛到最新值）。
+        if hasPendingLinkageRefresh {
+            hasPendingLinkageRefresh = false
+            Task { await refreshLinkageStatus(force: true) }
+            return false   // 这次请求由补跑代表，调用方别急着记账
+        }
         // await 期间用户可能已把开关关掉：以关后的设置为准收尾 ——
         // 不给已关闭的功能弹引导（呈现决策见 shouldShowCreationGuide）。
         if Self.shouldShowCreationGuide(
@@ -356,6 +395,7 @@ struct SettingsView: View {
         ) {
             showCreationChoice = true
         }
+        return true
     }
 
     /// 检查返回后的呈现决策（纯函数钉契约）：联动开着、没就绪、且

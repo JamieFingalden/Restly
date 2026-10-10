@@ -244,7 +244,12 @@ final class FocusModeBridge: ObservableObject {
            cache.names == currentNames,
            Date().timeIntervalSince(cache.timestamp) < existenceCacheTTL {
             resetMissingIfReady(cache.result)
-            settleAppliedNamesIfNeeded(currentNames)
+            // 转场只在 .ready 结算：missing/unknown（打字中间态、list
+            // 失败）时 appliedNames 一个字都不动 —— 对不完整的新对发
+            // 关闭会掐断进行中的专注。
+            if cache.result == .ready {
+                settleAppliedNamesIfNeeded(currentNames)
+            }
             return cache.result
         }
 
@@ -259,7 +264,11 @@ final class FocusModeBridge: ObservableObject {
         existenceCache = (currentNames, result, Date())
         recordExistence(result)
         resetMissingIfReady(result)
-        settleAppliedNamesIfNeeded(currentNames)
+        // 转场只在 .ready 结算（同上）—— 熔断复位语义不在此列，
+        // 那是检测路径自己的事，已由 resetMissingIfReady 处理。
+        if result == .ready {
+            settleAppliedNamesIfNeeded(currentNames)
+        }
         return result
     }
 

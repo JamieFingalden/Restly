@@ -1418,7 +1418,6 @@ final class FocusModeLinkageTests: XCTestCase {
 
         manager.pause()
         await drain()
-        print("DEBUG-P1 isMissing=\(bridge.isMissing) applied=\(manager.isFocusLinkApplied) desired=\(manager.isFocusLinkDesired) pending=\(manager.pendingOffCount) gen=\(manager.linkGeneration) appliedNames=\(String(describing: bridge.appliedNames))")
         XCTAssertTrue(bridge.isMissing)
         XCTAssertTrue(
             manager.isFocusLinkApplied,
@@ -1437,6 +1436,62 @@ final class FocusModeLinkageTests: XCTestCase {
             "重建后要补执行一次关闭"
         )
         XCTAssertFalse(manager.isFocusLinkApplied, "补关落定后账本归位")
+    }
+
+    // MARK: - 改名结算门控与占用挂起（codex 十轮 ①②）
+
+    /// ① 逐字段改名的中间态检查得 .missing：转场一个字都不动 ——
+    /// 零旧关、appliedNames 不变、无回调。对不完整的新对发关闭会
+    /// 掐断进行中的专注。
+    @MainActor
+    func testMidTypingMissingCheckDoesNotTriggerTransition() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(responses: [
+            (0, ""),                       // 旧对开启成功
+            (0, ""),                       // 打字中间态检查：list 空 → missing
+            (0, "新开\n新关\n"),            // 补全后的检查：ready
+        ])
+        var names = FocusModeBridge.ShortcutNames(on: "旧开", off: "旧关")
+        var transitionCount = 0
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { names },
+            focusTargetProvider: { nil }
+        )
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        bridge.onAppliedNamesChanged = { oldNames in
+            transitionCount += 1
+            manager.handleAppliedNamesTransition(from: oldNames)
+        }
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        XCTAssertEqual(bridge.appliedNames, .init(on: "旧开", off: "旧关"))
+
+        // 用户逐字段改名字：中间态（两条都不存在）→ missing。
+        names = .init(on: "打字中A", off: "打字中B")
+        let midExistence = await bridge.checkShortcutsExist(forceRefresh: true)
+        XCTAssertEqual(midExistence, .missing)
+        await drain()
+
+        XCTAssertEqual(transitionCount, 0, "missing 不得触发转场")
+        XCTAssertEqual(bridge.appliedNames, .init(on: "旧开", off: "旧关"), "appliedNames 不变")
+        XCTAssertEqual(runCalls(in: stub).map(\.name), ["旧开"], "零旧关：不许对中间态发关闭")
+
+        // 防矫枉过正：补全成已就绪的新对后，转场照常发生。
+        names = .init(on: "新开", off: "新关")
+        let readyExistence = await bridge.checkShortcutsExist(forceRefresh: true)
+        XCTAssertEqual(readyExistence, .ready)
+        await drain()
+        XCTAssertEqual(transitionCount, 1, ".ready 时转场照常发生")
+        for _ in 0..<5 { await drain() }   // 旧关/新开各是异步 Task，多让几轮
+        XCTAssertEqual(
+            runCalls(in: stub).map(\.name),
+            ["旧开", "旧关", "新开"]
+        )
+        XCTAssertEqual(bridge.appliedNames, .init(on: "新开", off: "新关"))
     }
 
     // MARK: - 名字转场（codex 六轮 ③）
@@ -1499,6 +1554,23 @@ final class FocusModeLinkageTests: XCTestCase {
         }
         await second.value
         XCTAssertEqual(sequence, ["failure-out", "tutorial-in"])
+    }
+
+    // MARK: - 占用挂起与记账时机（codex 十轮 ②）
+
+    /// 占用决策契约：已有检查在飞时新请求不丢弃（挂起补跑）。
+    func testLinkageRefreshQueuesWhenBusy() {
+        XCTAssertTrue(SettingsView.linkageRefreshQueuesWhenBusy(isChecking: true))
+        XCTAssertFalse(SettingsView.linkageRefreshQueuesWhenBusy(isChecking: false))
+    }
+
+    /// 记账时机契约：检查被接受（立即发起或挂起补跑）才记 lastSettled；
+    /// 被拒不记 —— 否则改名刷新被吞后，去重会让新名字永远不再结算。
+    func testSettleBookkeepingRequiresAcceptedCheck() {
+        let bookkeeping = SettingsView.settleBookkeeping(willCheck: true, settled: (on: "A", off: "B"))
+        XCTAssertEqual(bookkeeping?.on, "A")
+        XCTAssertEqual(bookkeeping?.off, "B")
+        XCTAssertNil(SettingsView.settleBookkeeping(willCheck: false, settled: (on: "A", off: "B")))
     }
 
     /// 名字结算去重：值未变（submit 后紧跟的 blur、重复 blur）零副作用；
