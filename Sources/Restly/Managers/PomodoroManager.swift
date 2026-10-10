@@ -403,10 +403,14 @@ final class PomodoroManager: ObservableObject {
             case .success(()):
                 isFocusLinkApplied = engaged
             case .failure(.missing):
-                // missing = 指令根本没跑（熔断短路或名单确认缺失），
-                // 无论开还是关，诚实的账本都是「未应用」——若此前真
-                // 开着，残留由 isMissing 路由到重建流程收敛。
-                isFocusLinkApplied = false
+                // missing 豁免（与转场的记账豁免相互独立）：指令没跑成，
+                // 两向语义不同 —— 开启失败：诚实话是「没开上」，记
+                // false；关闭失败：**保持原值**（先前开启已生效、off 没
+                // 跑，系统大概率仍开着）—— 就绪结算会把 applied=true ∧
+                // desired=false 当作需要补关的缺口，重建后补关，否则
+                // 专注模式永远开着。保持原值也让「开启自身就 missing」
+                // 的场景（本就没开上）不被误记成开着。
+                if engaged { isFocusLinkApplied = false }
                 presentFocusLinkageMissingToast()
             case .failure(.failed), .failure(.noFocusTarget):
                 // 指令真的跑了但失败：开失败=没开上（回 false），
@@ -453,7 +457,13 @@ final class PomodoroManager: ObservableObject {
 
         let bridge = focusModeBridge
         Task { @MainActor in
-            let result = await bridge.setFocusEngaged(false, with: oldNames)
+            // recordsAppliedNames=false：appliedNames 的前移只在结算点，
+            // 否则旧关成功会把账本写回旧对，新开失败时引发无限转场。
+            let result = await bridge.setFocusEngaged(
+                false,
+                with: oldNames,
+                recordsAppliedNames: false
+            )
             if pendingOffCount > 0 { pendingOffCount -= 1 }
             guard generation == linkGeneration else {
                 DebugEventLog.shared.log(

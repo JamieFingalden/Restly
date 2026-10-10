@@ -1343,6 +1343,102 @@ final class FocusModeLinkageTests: XCTestCase {
         XCTAssertTrue(manager.hasShownFocusLinkageWarning)
     }
 
+    // MARK: - codex 九轮（转场收敛 / missing 豁免 / 组平衡与顺序）
+
+    /// ① 换名 + 新开启持续失败：转场至多一次，不再出现第二次旧关
+    /// —— 旧关的记账豁免切断了「旧关成功写回旧对 → 又见缺口 →
+    /// 再转场」的无限循环。
+    @MainActor
+    func testAppliedNamesTransitionConvergesWhenNewOnKeepsFailing() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(responses: [
+            (0, ""),                     // 旧对开启成功
+            (0, "新开\n新关\n"),          // 改名后的检测 ready
+            (0, ""),                     // 转场旧关成功
+            (1, "找不到快捷指令"),         // 新对开启失败
+            (0, "新开\n新关\n"),          // 失败定性 list：ready
+        ])
+        var names = FocusModeBridge.ShortcutNames(on: "旧开", off: "旧关")
+        let bridge = FocusModeBridge(
+            runner: stub.runner,
+            namesProvider: { names },
+            focusTargetProvider: { nil }
+        )
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        bridge.onAppliedNamesChanged = { oldNames in
+            manager.handleAppliedNamesTransition(from: oldNames)
+        }
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        XCTAssertEqual(bridge.appliedNames, .init(on: "旧开", off: "旧关"))
+
+        // 用户换指认成已就绪的新对，随后结算路径重检。
+        names = .init(on: "新开", off: "新关")
+        _ = await bridge.checkShortcutsExist(forceRefresh: true)
+        await drain()
+
+        let runNames = runCalls(in: stub).map(\.name)
+        XCTAssertEqual(
+            runNames,
+            ["旧开", "旧关", "新开"],
+            "转场收敛：旧关至多一次，新开失败后不再重复转场"
+        )
+        XCTAssertEqual(bridge.appliedNames, .init(on: "新开", off: "新关"))
+        // 新开的失败是 .failed（list 显示两条都在）而非缺失：不熔断、
+        // 不弹缺失提醒，收敛靠停止重试逻辑本身。
+        XCTAssertFalse(bridge.isMissing)
+        XCTAssertFalse(manager.hasShownFocusLinkageWarning)
+    }
+
+    /// ② 关闭指令缺失的 disengage：applied 保持 true（系统大概率
+    /// 仍开着），重建后 onMissingCleared 驱动补关。
+    @MainActor
+    func testDisengageMissingKeepsAppliedTrueUntilRebuilt() async {
+        let (defaults, suiteName) = makeDefaults(enablingLinkage: true)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let stub = RunnerStub(responses: [
+            (0, ""),                       // 开启成功
+            (1, "找不到快捷指令"),           // 关闭指令被删，off 失败
+            (0, ""),                       // 定性 list：missing
+            (0, "Restly 专注开启\nRestly 专注关闭\n"),  // 重建后检测 ready
+            (0, ""),                       // 重建后的补关
+        ])
+        let bridge = makeBridge(runner: stub.runner)
+        let manager = makeManager(defaults: defaults, bridge: bridge)
+        bridge.onMissingCleared = { manager.syncFocusLinkage() }
+        await drain()
+
+        manager.startFocus()
+        await drain()
+        XCTAssertTrue(manager.isFocusLinkApplied)
+        XCTAssertFalse(bridge.isMissing)
+
+        manager.pause()
+        await drain()
+        print("DEBUG-P1 isMissing=\(bridge.isMissing) applied=\(manager.isFocusLinkApplied) desired=\(manager.isFocusLinkDesired) pending=\(manager.pendingOffCount) gen=\(manager.linkGeneration) appliedNames=\(String(describing: bridge.appliedNames))")
+        XCTAssertTrue(bridge.isMissing)
+        XCTAssertTrue(
+            manager.isFocusLinkApplied,
+            "关闭失败（missing）时账本要诚实：系统大概率仍开着"
+        )
+
+        // 用户重建指令：检测就绪 → 熔断复位 → 补关。
+        // 用户重建指令：检测就绪 → 熔断复位 → 补关。
+        let rebuildExistence = await bridge.checkShortcutsExist(forceRefresh: true)
+        XCTAssertEqual(rebuildExistence, .ready)
+        await drain()
+
+        XCTAssertEqual(
+            runCalls(in: stub).map(\.name),
+            ["Restly 专注开启", "Restly 专注关闭", "Restly 专注关闭"],
+            "重建后要补执行一次关闭"
+        )
+        XCTAssertFalse(manager.isFocusLinkApplied, "补关落定后账本归位")
+    }
+
     // MARK: - 名字转场（codex 六轮 ③）
 
     /// 应用中（旧对已开启）→ 改指认成已就绪的新对：先跑旧关闭、
@@ -1457,6 +1553,38 @@ final class FocusModeLinkageTests: XCTestCase {
             FocusModeBridge.readFocusTarget(at: coreURL, preferredLanguages: ["nl-NL"]),
             "勿扰本地化名无解就放弃生成，走教程路线"
         )
+    }
+
+    /// ③+④ 默认执行器的回调顺序契约：onProcessExit（子进程退出/
+    /// 启动失败）必须先于 completion —— 退出的 inFlightRuns.leave 挂在
+    /// onProcessExit 上，顺序颠倒会让退出保序等待落空。测试同时钉住
+    /// 成功与启动抛错两条路径（stub 无法覆盖生产时序，这里用真进程）。
+    func testDefaultRunnerSignalsExitBeforeCompletionInBothPaths() async {
+        let workQueue = DispatchQueue(label: "FocusModeLinkageTests.runner")
+        let runner = FocusModeBridge.defaultRunner(workQueue: workQueue)
+        final class OrderBox: @unchecked Sendable {
+            var events: [String] = []
+            var status: Int32?
+        }
+        let successBox = OrderBox()
+        let successExpectation = XCTestExpectation(description: "成功路径")
+        runner(["/bin/sh", "-c", "echo hi"], { successBox.events.append("exit") }) { _, output in
+            successBox.events.append("completion(\(output.trimmingCharacters(in: .whitespacesAndNewlines)))")
+            successExpectation.fulfill()
+        }
+        await fulfillment(of: [successExpectation], timeout: 30)
+        XCTAssertEqual(successBox.events, ["exit", "completion(hi)"])
+
+        let failureBox = OrderBox()
+        let failureExpectation = XCTestExpectation(description: "启动抛错路径")
+        runner(["/nonexistent-restly-probe-\(UUID().uuidString)"], { failureBox.events.append("exit") }) { status, output in
+            failureBox.events.append("completion")
+            failureBox.status = status
+            failureExpectation.fulfill()
+        }
+        await fulfillment(of: [failureExpectation], timeout: 30)
+        XCTAssertEqual(failureBox.events, ["exit", "completion"], "抛错路径同样先 exit 后 completion")
+        XCTAssertEqual(failureBox.status, -1)
     }
 
     /// 配置文件读不到/解析失败/为空都不得让一键创建死掉：

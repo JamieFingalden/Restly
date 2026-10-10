@@ -202,11 +202,17 @@ final class FocusModeBridge: ObservableObject {
 
     /// 执行开启/关闭快捷指令。已确认缺失时直接短路，不再起进程。
     /// `explicitNames` 供名字转场用：对「旧对」执行关闭时要把指令
-    /// 打到旧名字上，而不是当前指认的新名字。成功时把显式对记为
-    /// 已应用（转场关闭旧对也会记账，随后新对开启再覆盖）。
+    /// 打到旧名字上，而不是当前指认的新名字。
+    ///
+    /// `recordsAppliedNames = false` 是转场专用的记账豁免：转场旧关
+    /// 若把 appliedNames 写回旧对，新开启失败时结算会看到
+    /// 「applied(旧) ≠ 生效(新)」再次触发转场 —— 旧关新开无限循环、
+    /// 不停起 Shortcuts 进程。appliedNames 的前移只发生在检测就绪的
+    /// 结算点（settleAppliedNamesIfNeeded）。
     func setFocusEngaged(
         _ engaged: Bool,
-        with explicitNames: ShortcutNames? = nil
+        with explicitNames: ShortcutNames? = nil,
+        recordsAppliedNames: Bool = true
     ) async -> Result<Void, LinkageError> {
         guard !isMissing else { return .failure(.missing) }
         let currentNames = explicitNames ?? names
@@ -223,7 +229,9 @@ final class FocusModeBridge: ObservableObject {
             NSLog("Restly 专注模式快捷指令「\(name)」执行失败（\(status)）：\(output)")
             return .failure(.failed(status: status, output: output))
         }
-        appliedNames = currentNames
+        if recordsAppliedNames {
+            appliedNames = currentNames
+        }
         return .success(())
     }
 
@@ -802,9 +810,12 @@ final class FocusModeBridge: ObservableObject {
                 do {
                     try process.run()
                 } catch {
-                    DispatchQueue.main.async {
-                        completion(-1, "无法启动 shortcuts：\(error.localizedDescription)")
-                    }
+                    // 拉起失败也算「这次尝试结束」：onProcessExit 必须与
+                    // 成功路径同序触发（先 exit 后 completion），否则
+                    // run() 已 enter 的在飞组永久非零，之后每次退出
+                    // 都白等满超时。
+                    onProcessExit()
+                    completion(-1, "无法启动 shortcuts：\(error.localizedDescription)")
                     return
                 }
 
